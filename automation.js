@@ -16,13 +16,17 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36'
   });
+  context.setDefaultTimeout(30000);
 
   const page = await context.newPage();
   let status = 'error'; // fallback
 
   try {
-    // 🔑 UPDATE THIS: set env TARGET_URL in Render or replace with your authorized URL string
+    // 🔑 You will set this later in Render env (TARGET_URL) or hardcode it.
     const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('TARGET_URL is missing or invalid. Set it in Environment or hardcode the URL.');
+    }
     console.log('Navigating to:', url);
 
     await page.goto(url, {
@@ -41,10 +45,10 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     // Give the page time to respond
     await page.waitForTimeout(4000);
 
-    // --- Result classification (adjust text patterns to your site) ---
+    // --- Result classification (added phrase for setup page) ---
     const html = await page.content();
 
-    if (/Create your username/i.test(html)) {
+    if (/Create your username|Let's Set Up Your Account/i.test(html)) {
       status = 'valid';
     } else if (/could not find|do not have an account|unable to find|incorrect|not recognized/i.test(html)) {
       status = 'incorrect';

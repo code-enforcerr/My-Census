@@ -63,7 +63,9 @@ SSN,DOB (MM/DD/YYYY),ZIPCODE
 📦 Use multiple lines for bulk. Then send /export to download results.`);
 });
 
-// Log all messages (first 60 chars) and gate non-command messages
+// =========================
+// Progress-enabled handler
+// =========================
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
   const text = (msg.text || '').trim();
@@ -79,13 +81,43 @@ bot.on('message', async (msg) => {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (lines.length === 0) return;
 
-  await bot.sendMessage(chatId, `⏳ Processing ${lines.length} entries... Please wait.`);
+  const total = lines.length;
+  const startedAt = Date.now();
+
+  // Initial progress message
+  const progressMsg = await bot.sendMessage(
+    chatId,
+    `⏳ Processing ${total} entries... 0/${total}`
+  );
+
+  // Throttle progress edits (max ~1 per 1.2s) and always on final
+  let lastEdit = 0;
+  const maybeUpdateProgress = async (done) => {
+    const now = Date.now();
+    if (done === total || now - lastEdit >= 1200) {
+      const elapsed = Math.round((now - startedAt) / 1000);
+      const barLen = 20;
+      const filled = Math.max(0, Math.min(barLen, Math.round((done / total) * barLen)));
+      const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+      await bot.editMessageText(
+        `⏳ Processing ${total} entries...\n${bar} ${done}/${total}\n⏱️ ${elapsed}s elapsed`,
+        { chat_id: chatId, message_id: progressMsg.message_id }
+      ).catch(() => {});
+      lastEdit = now;
+    }
+  };
 
   const results = [];
+  let done = 0;
+
+  // Ensure screenshots dir exists (again, just in case)
+  if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+
   for (const line of lines) {
     const parts = line.split(',').map(p => p.trim());
     if (parts.length < 3) {
       results.push({ line, status: 'invalid' });
+      done++; await maybeUpdateProgress(done);
       continue;
     }
 
@@ -100,14 +132,23 @@ bot.on('message', async (msg) => {
       console.error('runAutomation error for', line, err.message || err);
       results.push({ line, status: 'error', screenshot: filename });
     }
+
+    done++;
+    await maybeUpdateProgress(done);
   }
 
-  // Zip this batch's screenshots
+  // Zip this batch's screenshots (ALL)
   const zipPath = path.join(__dirname, `screenshots_${Date.now()}.zip`);
   const output = fs.createWriteStream(zipPath);
   const archive = archiver('zip', { zlib: { level: 9 } });
 
   output.on('close', async () => {
+    // Final progress update to 100%
+    await bot.editMessageText(
+      `✅ Done. Processed ${total}/${total} entries.`,
+      { chat_id: chatId, message_id: progressMsg.message_id }
+    ).catch(() => {});
+
     try {
       await bot.sendDocument(chatId, zipPath);
     } catch (e) {
@@ -116,6 +157,51 @@ bot.on('message', async (msg) => {
     } finally {
       try { fs.unlinkSync(zipPath); } catch {}
     }
+
+    // ===== NEW: send "valid-only" CSV and ZIP =====
+    try {
+      const validResults = results.filter(r => r.status === 'valid');
+      if (validResults.length) {
+        // CSV of valid lines
+        const csvPath = path.join(__dirname, `valid_${Date.now()}.csv`);
+        const csv = 'ssn,dob,zip\n' + validResults.map(v => v.line).join('\n');
+        fs.writeFileSync(csvPath, csv);
+        await bot.sendDocument(
+          chatId,
+          csvPath,
+          {},
+          { filename: path.basename(csvPath), contentType: 'text/csv' }
+        ).catch(err => console.error('send valid.csv failed:', err?.message || err));
+        try { fs.unlinkSync(csvPath); } catch {}
+
+        // ZIP of valid screenshots only
+        const vZipPath = path.join(__dirname, `valid_screenshots_${Date.now()}.zip`);
+        const vOut = fs.createWriteStream(vZipPath);
+        const vArch = archiver('zip', { zlib: { level: 9 } });
+
+        await new Promise((resolve, reject) => {
+          vOut.on('close', resolve);
+          vArch.on('error', reject);
+          vArch.pipe(vOut);
+          for (const r of validResults) {
+            if (!r.screenshot) continue;
+            const p = path.join(SCREENSHOT_DIR, r.screenshot);
+            if (fs.existsSync(p)) vArch.file(p, { name: r.screenshot });
+          }
+          vArch.finalize();
+        });
+
+        await bot.sendDocument(chatId, vZipPath).catch(err =>
+          console.error('send valid zip failed:', err?.message || err)
+        );
+        try { fs.unlinkSync(vZipPath); } catch {}
+      } else {
+        await bot.sendMessage(chatId, 'ℹ️ No valid entries detected in this batch.');
+      }
+    } catch (e) {
+      console.error('valid export failed:', e?.message || e);
+    }
+    // ===== END NEW =====
 
     // Summaries
     const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
@@ -128,7 +214,7 @@ bot.on('message', async (msg) => {
     }
 
     let summary =
-`Processed ${lines.length} entries:
+`Processed ${total} entries:
 ✅ Valid: ${counts.valid}
 ❌ Incorrect: ${counts.incorrect}
 ❓ Unknown: ${counts.unknown}
