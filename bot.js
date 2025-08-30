@@ -145,7 +145,7 @@ bot.onText(/^\/export$/, async (msg) => {
 
   const files = (await fsp.readdir(SCREENSHOT_DIR).catch(() => []))
     .map(n => path.join(SCREENSHOT_DIR, n))
-    .filter(fp => fp.endsWith('.png') && fs.existsSync(fp));
+    .filter(fp => (fp.endsWith('.png') || fp.endsWith('.jpg')) && fs.existsSync(fp)); // ← include JPGs
 
   await sendZipArchive(bot, chatId, files, 'screenshots');
 });
@@ -208,7 +208,7 @@ bot.on('message', async (msg) => {
     }
 
     const [ssn, dob, zip] = parts;
-    const filename = `${ssn}_${Date.now()}.png`;
+    const filename = `${ssn}_${Date.now()}.jpg`; // ← save as JPG to match automation
     const screenshotPath = path.join(SCREENSHOT_DIR, filename);
 
     try {
@@ -229,12 +229,31 @@ bot.on('message', async (msg) => {
     { chat_id: chatId, message_id: progressMsg.message_id }
   ).catch(() => {});
 
-  // Build list of actual files and send archive
+  // Build list of actual files and send ALL-in-one archive
   const filePaths = results
     .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
     .filter(fp => fp && fs.existsSync(fp));
 
   await sendZipArchive(bot, chatId, filePaths, 'screenshots-batch');
+
+  // 👉 PER-CATEGORY ARCHIVES (Valid / Incorrect / Unknown / Error)
+  const groups = {
+    valid:     results.filter(r => r.status === 'valid'),
+    incorrect: results.filter(r => r.status === 'incorrect'),
+    unknown:   results.filter(r => r.status === 'unknown'),
+    error:     results.filter(r => r.status === 'error'),
+  };
+
+  for (const [label, arr] of Object.entries(groups)) {
+    const files = arr
+      .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
+      .filter(fp => fp && fs.existsSync(fp));
+
+    if (files.length) {
+      await sendZipArchive(bot, chatId, files, `screenshots-${label}`);
+    }
+  }
+  // 👈 END per-category zips
 
   // Summaries
   const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };

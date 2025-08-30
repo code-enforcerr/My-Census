@@ -1,7 +1,5 @@
 // automation.js
 // Use only on sites you have permission to automate.
-// Returns: { status: 'valid'|'incorrect'|'unknown'|'error', screenshotPath }
-
 const { chromium } = require('playwright');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -10,7 +8,7 @@ const path = require('path');
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;                     // MM/DD/YYYY
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s; // MM/DD/YYYY
   let m;
   if ((m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) return `${m[2]}/${m[3]}/${m[1]}`; // YYYY-MM-DD
   if ((m = /^(\d{2})[-/](\d{2})[-/](\d{4})$/.exec(s))) return `${m[2]}/${m[1]}/${m[3]}`; // DD/MM/YYYY
@@ -32,7 +30,7 @@ async function ensureWritablePath(requestedPath, base = 'shot') {
     const tmpDir = process.env.TMPDIR || '/tmp';
     await fsp.mkdir(tmpDir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    return path.join(tmpDir, `${base}-${ts}.png`);
+    return path.join(tmpDir, `${base}-${ts}.jpg`);
   }
 }
 
@@ -47,30 +45,54 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     ],
   });
 
+  // Narrow viewport so element screenshots are compact
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
+    viewport: { width: 900, height: 1000 },
   });
 
   const page = await context.newPage();
   let status = 'error';
   let shotPath = await ensureWritablePath(
-    screenshotPath || path.join(process.env.TMPDIR || '/tmp', 'shot.png'),
+    screenshotPath || path.join(process.env.TMPDIR || '/tmp', 'shot.jpg'),
     'shot'
   );
 
+  // Text rules — tuned so the red banner counts as INCORRECT
+   const SUCCESS_RULES = [
+    /create your username/i,
+    /verify your identity/i,
+    /security questions/i,
+    /confirmation sent/i,
+    // 👇 new explicit matches for your screenshot
+    /Let's Set Up Your Account/i,
+    /Setup Your Online Account/i,
+    /Username/i,
+    /Password/i,
+    /Identity.*Account.*Email.*Security.*Review/i,  // progress bar text
+  ];
+
+  const INCORRECT_RULES = [
+    /could not find/i,
+    /unable to find/i,
+    /do not have an account/i,
+    /not recognized/i,
+    /incorrect/i,
+    /no match/i,
+    // 👇 your screenshot's red banner
+    /Web access for your plan is currently unavailable/i,
+    /contact your employer/i,
+  ];
+
   try {
     const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
-    console.log('Navigating to:', url);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Try to ensure the form is visible (best effort)
     try { await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 }); } catch {}
 
-    // Fill fields (label/placeholder/name/id fallbacks)
+    // Fill helpers
     const dobNorm = normalizeDOB(dob);
-
     const tryFill = async (selectors, value) => {
       for (const sel of selectors) {
         try {
@@ -135,55 +157,45 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
 
     if (!clicked) throw new Error('Submit button not found');
 
-    // Let the site process
     try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
     await page.waitForTimeout(2500);
 
     // Classify
     const html = await page.content().catch(() => '');
-    const successRules = [/create your username/i, /verify your identity/i, /security questions/i, /confirmation sent/i];
-    const incorrectRules = [/could not find/i, /unable to find/i, /do not have an account/i, /not recognized/i, /incorrect/i, /no match/i];
-
-    if (successRules.some(r => r.test(html))) {
+    if (SUCCESS_RULES.some(r => r.test(html))) {
       status = 'valid';
-    } else if (incorrectRules.some(r => r.test(html))) {
+    } else if (INCORRECT_RULES.some(r => r.test(html))) {
       status = 'incorrect';
     } else {
       const hasError = await page.locator('[role="alert"], .error, .validation, .alert').first().isVisible().catch(() => false);
       status = hasError ? 'incorrect' : 'unknown';
     }
 
-    // Screenshot (form if possible)
+    // Small screenshot: crop around the form + heading; save as JPEG to reduce size
     try {
       const form = page.locator('form').first();
       const box = await form.boundingBox();
       if (box) {
-        await page.screenshot({
-          path: shotPath,
-          clip: {
-            x: Math.max(0, box.x),
-            y: Math.max(0, box.y),
-            width: Math.max(1, box.width),
-            height: Math.max(1, box.height + 120),
-          },
-        });
+        const padX = 40, padTop = 160, padBottom = 120;
+        const x = Math.max(0, box.x - padX);
+        const y = Math.max(0, box.y - padTop);
+        const width = Math.max(1, Math.min(context.viewportSize().width - x, box.width + padX * 2));
+        const height = Math.max(1, Math.min(context.viewportSize().height - y, box.height + padTop + padBottom));
+        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, clip: { x, y, width, height } });
       } else {
-        await page.screenshot({ path: shotPath, fullPage: true });
+        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: false });
       }
     } catch {
-      await page.screenshot({ path: shotPath, fullPage: true });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: false });
     }
 
     return { status, screenshotPath: shotPath };
   } catch (err) {
     console.error('❌ Error in runAutomation:', err?.message || err);
-
-    // Always try to produce an ERROR screenshot so the ZIP isn’t empty
     try {
       shotPath = await ensureWritablePath(shotPath, 'shot-error');
-      await page.screenshot({ path: shotPath, fullPage: true });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: true });
     } catch {}
-
     return { status: 'error', screenshotPath: shotPath };
   } finally {
     try { await context.close(); } catch {}
