@@ -33,8 +33,9 @@ function isApproved(id) {
 const MODE = (process.env.BOT_MODE || 'polling').toLowerCase();
 const PACE_MS = Math.max(0, parseInt(process.env.PACE_MS || '300', 10)); // delay between entries
 const CHUNK_SIZE = Math.max(1, parseInt(process.env.CHUNK_SIZE || '60', 10)); // process in chunks for huge pastes
+const ZIP_CHUNK_COUNT = Math.max(1, parseInt(process.env.ZIP_CHUNK_COUNT || '40', 10)); // screenshots per zip
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: MODE === 'polling', filepath: false });
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: MODE === 'polling' }); // keep filepath default (true)
 
 // Graceful shutdown so Telegram releases polling and browser closes
 async function stopBot() {
@@ -88,6 +89,45 @@ const normalizeDob = (s) => {
   return t;
 };
 
+// Helper: zip & send files in chunks, streaming each zip
+async function zipAndSend(botInst, chatId, files, namePrefix) {
+  if (!files.length) return;
+
+  // split into chunks to keep each zip smaller
+  const chunks = [];
+  for (let i = 0; i < files.length; i += ZIP_CHUNK_COUNT) {
+    chunks.push(files.slice(i, i + ZIP_CHUNK_COUNT));
+  }
+
+  let idx = 1;
+  for (const chunk of chunks) {
+    const zipPath = path.join(__dirname, `${namePrefix}_${Date.now()}_${idx}.zip`);
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    await new Promise((resolve, reject) => {
+      output.on('close', resolve);
+      archive.on('error', reject);
+      archive.pipe(output);
+      for (const f of chunk) archive.file(f.abs, { name: f.name });
+      archive.finalize();
+    });
+
+    try {
+      const size = fs.statSync(zipPath).size;
+      console.log(`Sending ZIP part ${idx}/${chunks.length} (${Math.round(size/1024/1024)}MB): ${path.basename(zipPath)}`);
+      await botInst.sendDocument(chatId, { source: fs.createReadStream(zipPath), filename: path.basename(zipPath) });
+    } catch (e) {
+      console.error('sendDocument failed:', e?.message || e);
+      await botInst.sendMessage(chatId, `❌ Failed to send ${path.basename(zipPath)}.`);
+    } finally {
+      try { fs.unlinkSync(zipPath); } catch {}
+    }
+
+    idx++;
+  }
+}
+
 // =========================
 // Progress-enabled handler
 // =========================
@@ -122,7 +162,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Build entries; ignore lines that don't look like 3-field CSV at all
   const lines = rawLines;
   const total = lines.length;
   const startedAt = Date.now();
@@ -197,83 +236,70 @@ bot.on('message', async (msg) => {
     // Continue to packaging and summary even if some entries threw
   }
 
-  // Zip this batch's screenshots (ALL)
-  const zipPath = path.join(__dirname, `screenshots_${Date.now()}.zip`);
-  const output = fs.createWriteStream(zipPath);
-  const archive = archiver('zip', { zlib: { level: 9 } });
+  // --- Gather ALL screenshots that exist ---
+  const allFiles = [];
+  for (const r of results) {
+    if (!r.screenshot) continue;
+    const abs = path.join(SCREENSHOT_DIR, r.screenshot);
+    if (fs.existsSync(abs)) allFiles.push({ abs, name: r.screenshot });
+  }
 
-  output.on('close', async () => {
-    // Final progress update to 100%
-    await bot.editMessageText(
-      `✅ Done. Processed ${total}/${total} entries.`,
-      { chat_id: chatId, message_id: progressMsg.message_id }
-    ).catch(() => {});
+  // Final progress update to 100%
+  await bot.editMessageText(
+    `✅ Done processing. Preparing files to send...`,
+    { chat_id: chatId, message_id: progressMsg.message_id }
+  ).catch(() => {});
 
-    try {
-      await bot.sendDocument(chatId, zipPath);
-    } catch (e) {
-      console.error('sendDocument failed:', e.message || e);
-      await bot.sendMessage(chatId, '❌ Failed to send ZIP archive.');
-    } finally {
-      try { fs.unlinkSync(zipPath); } catch {}
-    }
+  // Send all screenshots in chunked ZIPs (streamed)
+  await zipAndSend(bot, chatId, allFiles, 'screenshots');
 
-    // ===== Send "valid-only" CSV and ZIP =====
-    try {
-      const validResults = results.filter(r => r.status === 'valid');
-      if (validResults.length) {
-        // CSV of valid lines
-        const csvPath = path.join(__dirname, `valid_${Date.now()}.csv`);
-        const csvHeader = 'ssn,dob,zip\n';
-        const csvBody = validResults.map(v => v.line).join('\n');
-        fs.writeFileSync(csvPath, csvHeader + csvBody);
+  // ===== Send "valid-only" CSV and ZIPs =====
+  try {
+    const validResults = results.filter(r => r.status === 'valid');
+    if (validResults.length) {
+      // CSV of valid lines
+      const csvPath = path.join(__dirname, `valid_${Date.now()}.csv`);
+      const csvHeader = 'ssn,dob,zip\n';
+      const csvBody = validResults.map(v => v.line).join('\n');
+      fs.writeFileSync(csvPath, csvHeader + csvBody);
+      try {
         await bot.sendDocument(
           chatId,
-          csvPath,
-          {},
-          { filename: path.basename(csvPath), contentType: 'text/csv' }
-        ).catch(err => console.error('send valid.csv failed:', err?.message || err));
-        try { fs.unlinkSync(csvPath); } catch {}
-
-        // ZIP of valid screenshots only
-        const vZipPath = path.join(__dirname, `valid_screenshots_${Date.now()}.zip`);
-        const vOut = fs.createWriteStream(vZipPath);
-        const vArch = archiver('zip', { zlib: { level: 9 } });
-
-        await new Promise((resolve, reject) => {
-          vOut.on('close', resolve);
-          vArch.on('error', reject);
-          vArch.pipe(vOut);
-          for (const r of validResults) {
-            if (!r.screenshot) continue;
-            const p = path.join(SCREENSHOT_DIR, r.screenshot);
-            if (fs.existsSync(p)) vArch.file(p, { name: r.screenshot });
-          }
-          vArch.finalize();
-        });
-
-        await bot.sendDocument(chatId, vZipPath).catch(err =>
-          console.error('send valid zip failed:', err?.message || err)
+          { source: fs.createReadStream(csvPath), filename: path.basename(csvPath) }
         );
-        try { fs.unlinkSync(vZipPath); } catch {}
-      } else {
-        await bot.sendMessage(chatId, 'ℹ️ No valid entries detected in this batch.');
+      } catch (err) {
+        console.error('send valid.csv failed:', err?.message || err);
+        await bot.sendMessage(chatId, '❌ Failed to send valid.csv');
+      } finally {
+        try { fs.unlinkSync(csvPath); } catch {}
       }
-    } catch (e) {
-      console.error('valid export failed:', e?.message || e);
-    }
 
-    // Summaries
-    const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
-    for (const r of results) {
-      if (r.status === 'valid') counts.valid++;
-      else if (r.status === 'incorrect') counts.incorrect++;
-      else if (r.status === 'unknown') counts.unknown++;
-      else if (r.status === 'invalid') counts.invalid++;
-      else counts.error++;
+      // ZIPs of valid screenshots only (chunked, streamed)
+      const validFiles = [];
+      for (const r of validResults) {
+        if (!r.screenshot) continue;
+        const abs = path.join(SCREENSHOT_DIR, r.screenshot);
+        if (fs.existsSync(abs)) validFiles.push({ abs, name: r.screenshot });
+      }
+      await zipAndSend(bot, chatId, validFiles, 'valid_screenshots');
+    } else {
+      await bot.sendMessage(chatId, 'ℹ️ No valid entries detected in this batch.');
     }
+  } catch (e) {
+    console.error('valid export failed:', e?.message || e);
+  }
 
-    let summary =
+  // Summaries
+  const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
+  for (const r of results) {
+    if (r.status === 'valid') counts.valid++;
+    else if (r.status === 'incorrect') counts.incorrect++;
+    else if (r.status === 'unknown') counts.unknown++;
+    else if (r.status === 'invalid') counts.invalid++;
+    else counts.error++;
+  }
+
+  let summary =
 `Processed ${total} entries:
 ✅ Valid: ${counts.valid}
 ❌ Incorrect: ${counts.incorrect}
@@ -281,33 +307,15 @@ bot.on('message', async (msg) => {
 ⚠ Errors: ${counts.error}
 🚫 Invalid Format: ${counts.invalid}`;
 
-    if (counts.invalid > 0) {
-      summary += `
+  if (counts.invalid > 0) {
+    summary += `
 
 ℹ Expected format (3 fields, comma-separated):
 SSN,DOB (MM/DD/YYYY),ZIPCODE`;
-    }
-
-    await bot.sendMessage(chatId, summary);
-
-    // Release per-chat lock after everything is sent
-    processingChats.delete(chatId);
-  });
-
-  archive.on('error', async (err) => {
-    console.error('Archive error:', err);
-    await bot.sendMessage(chatId, '❌ Failed to create ZIP archive.');
-    processingChats.delete(chatId);
-  });
-
-  archive.pipe(output);
-  for (const r of results) {
-    if (r.screenshot) {
-      const p = path.join(SCREENSHOT_DIR, r.screenshot);
-      if (fs.existsSync(p)) archive.file(p, { name: r.screenshot });
-    }
   }
-  archive.finalize();
+
+  await bot.sendMessage(chatId, summary).catch(() => {});
+  processingChats.delete(chatId);
 });
 
 // (Keep your /export and /clean handlers if you had them)
