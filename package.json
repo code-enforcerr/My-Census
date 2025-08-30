@@ -3,7 +3,9 @@
   "private": true,
   "type": "commonjs",
   "main": "bot.js",
-  "engines": { "node": ">=18 <=22" },
+  "engines": {
+    "node": ">=18 <=22"
+  },
   "scripts": {
     "start": "node bot.js",
     "postinstall": "echo 'no-op'"
@@ -13,6 +15,7 @@
     "archiver": "^7.0.1",
     "date-fns": "^3.6.0",
     "dotenv": "^16.4.5",
+    "express": "^5.1.0",
     "node-telegram-bot-api": "^0.66.0",
     "playwright": "^1.54.1",
     "telegraf": "^4.16.3",
