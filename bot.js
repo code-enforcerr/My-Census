@@ -5,7 +5,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
-const { runAutomation } = require('./automation');
+const { runAutomation, shutdownBrowser } = require('./automation');
 
 // --- Fail fast if token is missing ---
 if (!process.env.TELEGRAM_TOKEN) {
@@ -29,7 +29,25 @@ function isApproved(id) {
   return approvedUsers.includes(idStr);
 }
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+// --- Runtime controls ---
+const MODE = (process.env.BOT_MODE || 'polling').toLowerCase();
+const PACE_MS = Math.max(0, parseInt(process.env.PACE_MS || '300', 10)); // delay between entries
+const CHUNK_SIZE = Math.max(1, parseInt(process.env.CHUNK_SIZE || '60', 10)); // process in chunks for huge pastes
+
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: MODE === 'polling', filepath: false });
+
+// Graceful shutdown so Telegram releases polling and browser closes
+async function stopBot() {
+  try { await bot.stopPolling(); } catch {}
+  try { await shutdownBrowser?.(); } catch {}
+  process.exit(0);
+}
+process.on('SIGINT', stopBot);
+process.on('SIGTERM', stopBot);
+
+// De-dup & per-chat lock
+const seenMessageIds = new Set();
+const processingChats = new Set();
 
 bot.setMyCommands([
   { command: '/start',   description: 'Start the bot' },
@@ -63,6 +81,13 @@ SSN,DOB (MM/DD/YYYY),ZIPCODE
 📦 Use multiple lines for bulk. Then send /export to download results.`);
 });
 
+// Small helper: normalize DOB like 12-31-1990 -> 12/31/1990
+const normalizeDob = (s) => {
+  const t = String(s || '').trim();
+  if (/^\d{2}-\d{2}-\d{4}$/.test(t)) return t.replace(/-/g, '/');
+  return t;
+};
+
 // =========================
 // Progress-enabled handler
 // =========================
@@ -71,16 +96,34 @@ bot.on('message', async (msg) => {
   const text = (msg.text || '').trim();
   const ok = isApproved(chatId);
 
-  // skip commands here; they have their own handlers
+  // Skip commands; they have their own handlers
   if (!text || text.startsWith('/')) return;
 
+  // De-dup: ignore retries of same Telegram message
+  if (seenMessageIds.has(msg.message_id)) return;
+  seenMessageIds.add(msg.message_id);
+
+  // Per-chat lock: avoid overlapping batches in same chat
+  if (processingChats.has(chatId)) {
+    return bot.sendMessage(chatId, '⏳ Still processing your previous batch. Please wait.');
+  }
+  processingChats.add(chatId);
+
   console.log(`🔧 MSG from ${chatId} approved=${ok} text=${JSON.stringify(text.slice(0, 60))}`);
-  if (!ok) return bot.sendMessage(chatId, '🚫 Access Denied: You are not an approved user.');
+  if (!ok) {
+    processingChats.delete(chatId);
+    return bot.sendMessage(chatId, '🚫 Access Denied: You are not an approved user.');
+  }
 
   // Parse lines
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  if (lines.length === 0) return;
+  const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (rawLines.length === 0) {
+    processingChats.delete(chatId);
+    return;
+  }
 
+  // Build entries; ignore lines that don't look like 3-field CSV at all
+  const lines = rawLines;
   const total = lines.length;
   const startedAt = Date.now();
 
@@ -110,31 +153,48 @@ bot.on('message', async (msg) => {
   const results = [];
   let done = 0;
 
-  // Ensure screenshots dir exists (again, just in case)
+  // Ensure screenshots dir exists (again)
   if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
-  for (const line of lines) {
-    const parts = line.split(',').map(p => p.trim());
-    if (parts.length < 3) {
-      results.push({ line, status: 'invalid' });
-      done++; await maybeUpdateProgress(done);
-      continue;
+  // Process in chunks to control memory spikes on huge pastes
+  const chunks = [];
+  for (let i = 0; i < lines.length; i += CHUNK_SIZE) {
+    chunks.push(lines.slice(i, i + CHUNK_SIZE));
+  }
+
+  try {
+    for (const chunk of chunks) {
+      for (const line of chunk) {
+        const parts = line.split(',').map(p => p.trim());
+        if (parts.length < 3) {
+          results.push({ line, status: 'invalid' });
+          done++; await maybeUpdateProgress(done);
+          continue;
+        }
+
+        const [ssn, dobRaw, zip] = parts;
+        const dob = normalizeDob(dobRaw);
+
+        const filename = `${ssn}_${Date.now()}.png`;
+        const screenshotPath = path.join(SCREENSHOT_DIR, filename);
+
+        try {
+          const { status } = await runAutomation(ssn, dob, zip, screenshotPath);
+          results.push({ line, status, screenshot: filename });
+        } catch (err) {
+          console.error('runAutomation error for', line, err.message || err);
+          results.push({ line, status: 'error', screenshot: filename });
+        }
+
+        done++;
+        await maybeUpdateProgress(done);
+
+        // Gentle pacing to reduce rate limits & RAM churn
+        if (PACE_MS) await new Promise(r => setTimeout(r, PACE_MS));
+      }
     }
-
-    const [ssn, dob, zip] = parts;
-    const filename = `${ssn}_${Date.now()}.png`;
-    const screenshotPath = path.join(SCREENSHOT_DIR, filename);
-
-    try {
-      const { status } = await runAutomation(ssn, dob, zip, screenshotPath);
-      results.push({ line, status, screenshot: filename });
-    } catch (err) {
-      console.error('runAutomation error for', line, err.message || err);
-      results.push({ line, status: 'error', screenshot: filename });
-    }
-
-    done++;
-    await maybeUpdateProgress(done);
+  } finally {
+    // Continue to packaging and summary even if some entries threw
   }
 
   // Zip this batch's screenshots (ALL)
@@ -158,14 +218,15 @@ bot.on('message', async (msg) => {
       try { fs.unlinkSync(zipPath); } catch {}
     }
 
-    // ===== NEW: send "valid-only" CSV and ZIP =====
+    // ===== Send "valid-only" CSV and ZIP =====
     try {
       const validResults = results.filter(r => r.status === 'valid');
       if (validResults.length) {
         // CSV of valid lines
         const csvPath = path.join(__dirname, `valid_${Date.now()}.csv`);
-        const csv = 'ssn,dob,zip\n' + validResults.map(v => v.line).join('\n');
-        fs.writeFileSync(csvPath, csv);
+        const csvHeader = 'ssn,dob,zip\n';
+        const csvBody = validResults.map(v => v.line).join('\n');
+        fs.writeFileSync(csvPath, csvHeader + csvBody);
         await bot.sendDocument(
           chatId,
           csvPath,
@@ -201,7 +262,6 @@ bot.on('message', async (msg) => {
     } catch (e) {
       console.error('valid export failed:', e?.message || e);
     }
-    // ===== END NEW =====
 
     // Summaries
     const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
@@ -229,11 +289,15 @@ SSN,DOB (MM/DD/YYYY),ZIPCODE`;
     }
 
     await bot.sendMessage(chatId, summary);
+
+    // Release per-chat lock after everything is sent
+    processingChats.delete(chatId);
   });
 
-  archive.on('error', (err) => {
+  archive.on('error', async (err) => {
     console.error('Archive error:', err);
-    bot.sendMessage(chatId, '❌ Failed to create ZIP archive.');
+    await bot.sendMessage(chatId, '❌ Failed to create ZIP archive.');
+    processingChats.delete(chatId);
   });
 
   archive.pipe(output);
