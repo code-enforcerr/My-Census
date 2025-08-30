@@ -1,5 +1,7 @@
 // automation.js
 // Use only on sites you have permission to automate.
+// Returns: { status: 'valid'|'incorrect'|'unknown'|'error', screenshotPath }
+
 const { chromium } = require('playwright');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -8,7 +10,7 @@ const path = require('path');
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s; // MM/DD/YYYY
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;                // MM/DD/YYYY
   let m;
   if ((m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) return `${m[2]}/${m[3]}/${m[1]}`; // YYYY-MM-DD
   if ((m = /^(\d{2})[-/](\d{2})[-/](\d{4})$/.exec(s))) return `${m[2]}/${m[1]}/${m[3]}`; // DD/MM/YYYY
@@ -59,37 +61,18 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     'shot'
   );
 
-  // Text rules — tuned so the red banner counts as INCORRECT
-   const SUCCESS_RULES = [
-    /create your username/i,
-    /verify your identity/i,
-    /security questions/i,
-    /confirmation sent/i,
-    // 👇 new explicit matches for your screenshot
-    /Let's Set Up Your Account/i,
-    /Setup Your Online Account/i,
-    /Username/i,
-    /Password/i,
-    /Identity.*Account.*Email.*Security.*Review/i,  // progress bar text
-  ];
-
-  const INCORRECT_RULES = [
-    /could not find/i,
-    /unable to find/i,
-    /do not have an account/i,
-    /not recognized/i,
-    /incorrect/i,
-    /no match/i,
-    // 👇 your screenshot's red banner
-    /Web access for your plan is currently unavailable/i,
-    /contact your employer/i,
-  ];
-
   try {
+    // 🔐 TARGET URL: set env TARGET_URL or hardcode your authorized URL below
     const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
+    if (!/^https?:\/\//i.test(url) || /YOUR_AUTHORIZED_URL_HERE|dommy/i.test(url)) {
+      throw new Error('TARGET_URL is not set to a real authorized https URL');
+    }
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    try { await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 }); } catch {}
+    // Try to ensure the form is visible (best-effort)
+    try {
+      await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 });
+    } catch {}
 
     // Fill helpers
     const dobNorm = normalizeDOB(dob);
@@ -157,18 +140,58 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
 
     if (!clicked) throw new Error('Submit button not found');
 
+    // Let the site process
     try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
     await page.waitForTimeout(2500);
 
-    // Classify
-    const html = await page.content().catch(() => '');
-    if (SUCCESS_RULES.some(r => r.test(html))) {
+    // ----- Element-based classification -----
+
+    // A. Red banner case → INCORRECT
+    const redBanner = await page
+      .locator('text=Web access for your plan is currently unavailable')
+      .isVisible()
+      .catch(() => false);
+
+    // B. The VALID page (heading + username field visible)
+    const headingValid = await page
+      .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
+      .isVisible()
+      .catch(() => false);
+
+    const usernameVisible = await page
+      .getByLabel(/username/i)
+      .isVisible()
+      .catch(() => false);
+
+    // C. Generic alert/error containers
+    const anyAlert = await page
+      .locator('[role="alert"], .alert, .validation, .error')
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    if (redBanner) {
+      status = 'incorrect';
+    } else if (headingValid && usernameVisible) {
       status = 'valid';
-    } else if (INCORRECT_RULES.some(r => r.test(html))) {
+    } else if (anyAlert) {
       status = 'incorrect';
     } else {
-      const hasError = await page.locator('[role="alert"], .error, .validation, .alert').first().isVisible().catch(() => false);
-      status = hasError ? 'incorrect' : 'unknown';
+      // Fallback to text rules if UI changes
+      const html = await page.content().catch(() => '');
+      const SUCCESS_RULES = [
+        /create your username/i,
+        /verify your identity/i,
+        /security questions/i,
+        /confirmation sent/i,
+        /identity.*account.*email.*security.*review/i, // progress bar
+      ];
+      const INCORRECT_RULES = [
+        /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
+      ];
+      if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
+      else if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
+      else status = 'unknown';
     }
 
     // Small screenshot: crop around the form + heading; save as JPEG to reduce size
