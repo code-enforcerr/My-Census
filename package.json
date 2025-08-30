@@ -1,19 +1,19 @@
 {
   "name": "census-code",
   "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
   "main": "bot.js",
+  "engines": { "node": ">=18 <=22" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js",
+    "postinstall": "npx playwright install --with-deps chromium"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
     "adm-zip": "^0.5.16",
     "archiver": "^7.0.1",
-    "date-fns": "^4.1.0",
-    "dotenv": "^17.2.0",
+    "date-fns": "^3.6.0",
+    "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.66.0",
     "playwright": "^1.54.1",
     "telegraf": "^4.16.3",
