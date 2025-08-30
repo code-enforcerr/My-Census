@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
 const archiver = require('archiver');
 const { runAutomation } = require('./automation');
@@ -46,9 +47,69 @@ bot.onText(/^\/whoami$/, (msg) => {
   bot.sendMessage(cid, `chat_id: ${cid} ${uname}`);
 });
 
-// Ensure screenshots dir exists
-const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
-if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+// ---- Writable locations (Render/Vercel) ----
+const TMP_DIR = process.env.TMPDIR || '/tmp';
+const SCREENSHOT_DIR = path.join(TMP_DIR, 'screenshots');
+
+(async () => {
+  await fsp.mkdir(SCREENSHOT_DIR, { recursive: true }).catch(() => {});
+})();
+
+// Utility: build + send a ZIP safely
+async function sendZipArchive(bot, chatId, filePaths, baseName = 'screenshots') {
+  if (!filePaths.length) {
+    await bot.sendMessage(chatId, 'ℹ️ No files to export.');
+    return;
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const zipPath = path.join(TMP_DIR, `${baseName}-${ts}.zip`);
+
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    output.on('close', resolve);
+    output.on('error', reject);
+    archive.on('warning', (err) => {
+      // ENOENT = file missing; skip it, otherwise fail
+      if (err.code !== 'ENOENT') reject(err);
+    });
+    archive.on('error', reject);
+
+    archive.pipe(output);
+
+    for (const fp of filePaths) {
+      if (fp && fs.existsSync(fp)) {
+        archive.file(fp, { name: path.basename(fp) });
+      }
+    }
+
+    archive.finalize();
+  });
+
+  // Size check: Telegram bot file limit ~50MB
+  const { size } = await fsp.stat(zipPath);
+  if (size >= 49 * 1024 * 1024) {
+    try { await fsp.unlink(zipPath); } catch {}
+    await bot.sendMessage(chatId, '❌ ZIP is too large for Telegram. Try fewer entries.');
+    return;
+  }
+
+  try {
+    await bot.sendDocument(
+      chatId,
+      fs.createReadStream(zipPath),
+      { caption: `Export (${filePaths.length} file${filePaths.length === 1 ? '' : 's'})` },
+      { filename: path.basename(zipPath), contentType: 'application/zip' }
+    );
+  } catch (e) {
+    console.error('sendDocument failed:', e?.message || e);
+    await bot.sendMessage(chatId, '❌ Failed to send ZIP archive.');
+  } finally {
+    try { await fsp.unlink(zipPath); } catch {}
+  }
+}
 
 // Strict /start (exact command, no args)
 bot.onText(/^\/start$/, (msg) => {
@@ -61,6 +122,32 @@ bot.onText(/^\/start$/, (msg) => {
 SSN,DOB (MM/DD/YYYY),ZIPCODE
 
 📦 Use multiple lines for bulk. Then send /export to download results.`);
+});
+
+// Optional: /clean (wipe /tmp/screenshots)
+bot.onText(/^\/clean$/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
+  try {
+    const items = await fsp.readdir(SCREENSHOT_DIR);
+    await Promise.all(items.map(i => fsp.unlink(path.join(SCREENSHOT_DIR, i)).catch(() => {})));
+    await bot.sendMessage(chatId, '🧹 Cleaned stored screenshots.');
+  } catch (e) {
+    console.error('clean error', e);
+    await bot.sendMessage(chatId, '⚠️ Could not clean screenshots.');
+  }
+});
+
+// Optional: /export (zip whatever is currently stored)
+bot.onText(/^\/export$/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
+
+  const files = (await fsp.readdir(SCREENSHOT_DIR).catch(() => []))
+    .map(n => path.join(SCREENSHOT_DIR, n))
+    .filter(fp => fp.endsWith('.png') && fs.existsSync(fp));
+
+  await sendZipArchive(bot, chatId, files, 'screenshots');
 });
 
 // =========================
@@ -110,8 +197,7 @@ bot.on('message', async (msg) => {
   const results = [];
   let done = 0;
 
-  // Ensure screenshots dir exists (again, just in case)
-  if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+  await fsp.mkdir(SCREENSHOT_DIR, { recursive: true }).catch(() => {});
 
   for (const line of lines) {
     const parts = line.split(',').map(p => p.trim());
@@ -137,38 +223,30 @@ bot.on('message', async (msg) => {
     await maybeUpdateProgress(done);
   }
 
-  // Zip this batch's screenshots
-  const zipPath = path.join(__dirname, `screenshots_${Date.now()}.zip`);
-  const output = fs.createWriteStream(zipPath);
-  const archive = archiver('zip', { zlib: { level: 9 } });
+  // Final progress update to 100% (before export)
+  await bot.editMessageText(
+    `Processing ${total} entries...  ${total}/${total}`,
+    { chat_id: chatId, message_id: progressMsg.message_id }
+  ).catch(() => {});
 
-  output.on('close', async () => {
-    // Final progress update to 100%
-    await bot.editMessageText(
-      `✅ Done. Processed ${total}/${total} entries.`,
-      { chat_id: chatId, message_id: progressMsg.message_id }
-    ).catch(() => {});
+  // Build list of actual files and send archive
+  const filePaths = results
+    .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
+    .filter(fp => fp && fs.existsSync(fp));
 
-    try {
-      await bot.sendDocument(chatId, zipPath);
-    } catch (e) {
-      console.error('sendDocument failed:', e.message || e);
-      await bot.sendMessage(chatId, '❌ Failed to send ZIP archive.');
-    } finally {
-      try { fs.unlinkSync(zipPath); } catch {}
-    }
+  await sendZipArchive(bot, chatId, filePaths, 'screenshots-batch');
 
-    // Summaries
-    const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
-    for (const r of results) {
-      if (r.status === 'valid') counts.valid++;
-      else if (r.status === 'incorrect') counts.incorrect++;
-      else if (r.status === 'unknown') counts.unknown++;
-      else if (r.status === 'invalid') counts.invalid++;
-      else counts.error++;
-    }
+  // Summaries
+  const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
+  for (const r of results) {
+    if (r.status === 'valid') counts.valid++;
+    else if (r.status === 'incorrect') counts.incorrect++;
+    else if (r.status === 'unknown') counts.unknown++;
+    else if (r.status === 'invalid') counts.invalid++;
+    else counts.error++;
+  }
 
-    let summary =
+  let summary =
 `Processed ${total} entries:
 ✅ Valid: ${counts.valid}
 ❌ Incorrect: ${counts.incorrect}
@@ -176,29 +254,12 @@ bot.on('message', async (msg) => {
 ⚠ Errors: ${counts.error}
 🚫 Invalid Format: ${counts.invalid}`;
 
-    if (counts.invalid > 0) {
-      summary += `
+  if (counts.invalid > 0) {
+    summary += `
 
 ℹ Expected format (3 fields, comma-separated):
 SSN,DOB (MM/DD/YYYY),ZIPCODE`;
-    }
-
-    await bot.sendMessage(chatId, summary);
-  });
-
-  archive.on('error', (err) => {
-    console.error('Archive error:', err);
-    bot.sendMessage(chatId, '❌ Failed to create ZIP archive.');
-  });
-
-  archive.pipe(output);
-  for (const r of results) {
-    if (r.screenshot) {
-      const p = path.join(SCREENSHOT_DIR, r.screenshot);
-      if (fs.existsSync(p)) archive.file(p, { name: r.screenshot });
-    }
   }
-  archive.finalize();
-});
 
-// (Keep your /export and /clean handlers if you had them)
+  await bot.sendMessage(chatId, summary);
+});
