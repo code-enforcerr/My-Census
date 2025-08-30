@@ -36,16 +36,44 @@ bot.setMyCommands([
   { command: '/whoami',  description: 'Show your chat id' }
 ]);
 
+// --- Helper: safe file sending ---
+async function sendFile(botInst, chatId, absPath) {
+  let p = absPath;
+  if (!fs.existsSync(p)) {
+    if (p.toLowerCase().endsWith('.png')) {
+      const alt = p.slice(0, -4) + '.jpg';
+      if (fs.existsSync(alt)) p = alt;
+    }
+  }
+
+  if (!fs.existsSync(p)) {
+    console.error('sendFile: not found', absPath);
+    await botInst.sendMessage(chatId, `❌ File not found: ${path.basename(absPath)}`);
+    return;
+  }
+
+  try {
+    const size = fs.statSync(p).size;
+    console.log(`sendFile: ${path.basename(p)} (${Math.round(size/1024/1024)} MB)`);
+  } catch {}
+
+  await botInst.sendChatAction(chatId, 'upload_document').catch(()=>{});
+  await botInst.sendDocument(chatId, {
+    source: fs.createReadStream(p),
+    filename: path.basename(p),
+  });
+}
+
+// Ensure screenshots dir exists
+const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
+if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+
 // Always allow /whoami
 bot.onText(/^\/whoami$/, (msg) => {
   const cid = String(msg.chat.id);
   const uname = msg.from?.username ? '@' + msg.from.username : '';
   bot.sendMessage(cid, `chat_id: ${cid} ${uname}`);
 });
-
-// Ensure screenshots dir exists
-const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
-if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 // /start
 bot.onText(/^\/start$/, (msg) => {
@@ -111,13 +139,14 @@ bot.on('message', async (msg) => {
 
   output.on('close', async () => {
     try {
-      await bot.sendDocument(chatId, zipPath);
+      await sendFile(bot, chatId, zipPath); // ✅ robust send
     } catch (e) {
       await bot.sendMessage(chatId, '❌ Failed to send ZIP archive.');
     } finally {
       try { fs.unlinkSync(zipPath); } catch {}
     }
 
+    // Summary
     const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
     for (const r of results) {
       if (r.status === 'valid') counts.valid++;
