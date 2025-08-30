@@ -21,8 +21,8 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
   let status = 'error'; // fallback
 
   try {
-    // 🔑 Replace with your own authorized/staging URL
-    const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
+    // 🔑 UPDATE THIS: set env TARGET_URL in Render or replace with your authorized URL string
+    const url = process.env.TARGET_URL || 'https://YOUR_AUTHORIZED_URL_HERE';
     console.log('Navigating to:', url);
 
     await page.goto(url, {
@@ -59,8 +59,6 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
       if (box) {
         await page.screenshot({
           path: screenshotPath,
-          type: 'jpeg',     // ✅ save as JPEG
-          quality: 60,      // ✅ compress
           clip: {
             x: box.x,
             y: box.y,
@@ -69,20 +67,10 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
           },
         });
       } else {
-        await page.screenshot({
-          path: screenshotPath,
-          type: 'jpeg',     // ✅ save as JPEG
-          quality: 60,      // ✅ compress
-          fullPage: true
-        });
+        await page.screenshot({ path: screenshotPath, fullPage: true });
       }
     } catch {
-      await page.screenshot({
-        path: screenshotPath,
-        type: 'jpeg',       // ✅ save as JPEG
-        quality: 60,        // ✅ compress
-        fullPage: true
-      });
+      await page.screenshot({ path: screenshotPath, fullPage: true });
     }
 
     return { status, screenshotPath };
