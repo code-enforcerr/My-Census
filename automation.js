@@ -147,52 +147,58 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     // ----- Element-based classification -----
 
     // A. Red banner case → INCORRECT
-    const redBanner = await page
-      .locator('text=Web access for your plan is currently unavailable')
-      .isVisible()
-      .catch(() => false);
+    // ----- Element-based classification (final) -----
 
-    // B. The VALID page (heading + username field visible)
-    const headingValid = await page
-      .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
-      .isVisible()
-      .catch(() => false);
+// A) Strong INCORRECT signals (check first)
+const redBanner = await page
+  .getByText(/web access .* currently unavailable/i, { exact: false })
+  .first()
+  .isVisible()
+  .catch(() => false);
 
-    const usernameVisible = await page
-      .getByLabel(/username/i)
-      .isVisible()
-      .catch(() => false);
+const identityHeading = await page
+  .getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i })
+  .isVisible()
+  .catch(() => false);
 
-    // C. Generic alert/error containers
-    const anyAlert = await page
-      .locator('[role="alert"], .alert, .validation, .error')
-      .first()
-      .isVisible()
-      .catch(() => false);
+const anyAlert = await page
+  .locator('[role="alert"], .alert, .validation, .error, .error-message, .message--error')
+  .first()
+  .isVisible()
+  .catch(() => false);
 
-    if (redBanner) {
-      status = 'incorrect';
-    } else if (headingValid && usernameVisible) {
-      status = 'valid';
-    } else if (anyAlert) {
-      status = 'incorrect';
-    } else {
-      // Fallback to text rules if UI changes
-      const html = await page.content().catch(() => '');
-      const SUCCESS_RULES = [
-        /create your username/i,
-        /verify your identity/i,
-        /security questions/i,
-        /confirmation sent/i,
-        /identity.*account.*email.*security.*review/i, // progress bar
-      ];
-      const INCORRECT_RULES = [
-        /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
-      ];
-      if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
-      else if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
-      else status = 'unknown';
-    }
+// B) Strong VALID signals
+const setupHeading = await page
+  .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
+  .isVisible()
+  .catch(() => false);
+
+const usernameVisible = await page
+  .getByLabel(/username/i)
+  .isVisible()
+  .catch(() => false);
+
+// Decide in strict order
+if (redBanner || identityHeading || anyAlert) {
+  status = 'incorrect';
+} else if (setupHeading && usernameVisible) {
+  status = 'valid';
+} else {
+  // minimal fallback only (avoid false "valid" on identity page)
+  const html = await page.content().catch(() => '');
+  const SUCCESS_RULES = [
+    /create your username/i,
+    /security questions/i,
+    /confirmation sent/i,
+    /identity.*account.*email.*security.*review/i, // progress bar
+  ];
+  const INCORRECT_RULES = [
+    /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
+  ];
+  if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
+  else if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
+  else status = 'unknown';
+}
 
     // Small screenshot: crop around the form + heading; save as JPEG to reduce size
     try {

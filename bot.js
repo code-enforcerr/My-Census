@@ -184,7 +184,6 @@ bot.on('message', async (msg) => {
   const filePaths = results
     .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
     .filter(fp => fp && fs.existsSync(fp));
-  await sendZipArchive(bot, chatId, filePaths, 'screenshots-batch');
 
   // Per-category archives
   const groups = {
