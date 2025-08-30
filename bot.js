@@ -5,7 +5,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
-const { runAutomation, shutdownBrowser } = require('./automation');
+const { runAutomation } = require('./automation');
 
 // --- Fail fast if token is missing ---
 if (!process.env.TELEGRAM_TOKEN) {
@@ -18,37 +18,16 @@ const rawApproved = (process.env.APPROVED_USERS || '').trim();
 const approvedUsers = rawApproved
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean); // e.g. ["8134029062","123456789"]
+  .filter(Boolean);
 
 console.log('🔧 ENV DEBUG → APPROVED_USERS (raw):', JSON.stringify(rawApproved));
 console.log('🔧 ENV DEBUG → approvedUsers (parsed):', approvedUsers);
 
-// Helper to check access consistently (works for DMs and groups)
 function isApproved(id) {
-  const idStr = String(id).trim();     // normalize to string
-  return approvedUsers.includes(idStr);
+  return approvedUsers.includes(String(id).trim());
 }
 
-// --- Runtime controls ---
-const MODE = (process.env.BOT_MODE || 'polling').toLowerCase();
-const PACE_MS = Math.max(0, parseInt(process.env.PACE_MS || '300', 10)); // delay between entries
-const CHUNK_SIZE = Math.max(1, parseInt(process.env.CHUNK_SIZE || '60', 10)); // process in chunks for huge pastes
-const ZIP_CHUNK_COUNT = Math.max(1, parseInt(process.env.ZIP_CHUNK_COUNT || '40', 10)); // screenshots per zip
-
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: MODE === 'polling' }); // keep filepath default (true)
-
-// Graceful shutdown so Telegram releases polling and browser closes
-async function stopBot() {
-  try { await bot.stopPolling(); } catch {}
-  try { await shutdownBrowser?.(); } catch {}
-  process.exit(0);
-}
-process.on('SIGINT', stopBot);
-process.on('SIGTERM', stopBot);
-
-// De-dup & per-chat lock
-const seenMessageIds = new Set();
-const processingChats = new Set();
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
 bot.setMyCommands([
   { command: '/start',   description: 'Start the bot' },
@@ -57,11 +36,10 @@ bot.setMyCommands([
   { command: '/whoami',  description: 'Show your chat id' }
 ]);
 
-// Always allow /whoami so you can fetch your id even if not approved
+// Always allow /whoami
 bot.onText(/^\/whoami$/, (msg) => {
   const cid = String(msg.chat.id);
   const uname = msg.from?.username ? '@' + msg.from.username : '';
-  console.log('🔧 /whoami →', cid, uname);
   bot.sendMessage(cid, `chat_id: ${cid} ${uname}`);
 });
 
@@ -69,12 +47,10 @@ bot.onText(/^\/whoami$/, (msg) => {
 const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
 if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
-// Strict /start (exact command, no args)
+// /start
 bot.onText(/^\/start$/, (msg) => {
   const chatId = String(msg.chat.id);
-  const ok = isApproved(chatId);
-  console.log(`🔧 /start from ${chatId} approved=${ok}`);
-  if (!ok) return bot.sendMessage(chatId, '🚫 Access Denied: You are not an approved user.');
+  if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
 
   bot.sendMessage(chatId, `👋 Send data in this format:
 SSN,DOB (MM/DD/YYYY),ZIPCODE
@@ -82,280 +58,91 @@ SSN,DOB (MM/DD/YYYY),ZIPCODE
 📦 Use multiple lines for bulk. Then send /export to download results.`);
 });
 
-// Small helper: normalize DOB like 12-31-1990 -> 12/31/1990
-const normalizeDob = (s) => {
-  const t = String(s || '').trim();
-  if (/^\d{2}-\d{2}-\d{4}$/.test(t)) return t.replace(/-/g, '/');
-  return t;
-};
+// Progress-enabled handler
+bot.on('message', async (msg) => {
+  const chatId = String(msg.chat.id);
+  const text = (msg.text || '').trim();
+  if (!text || text.startsWith('/')) return;
 
-// Helper: zip & send files in chunks, streaming each zip
-// knobs (env overrideable)
-// knobs (env overrideable)
-const MAX_ZIP_MB = Math.max(5, parseInt(process.env.MAX_ZIP_MB || '45', 10)); // Telegram is picky
+  if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
 
-// --- keep only this function below ---
-async function zipAndSend(botInst, chatId, files, namePrefix) {
-  if (!files.length) return;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return;
 
-  const bundles = [];
-  let cur = [], curBytes = 0;
-  const byteCap = MAX_ZIP_MB * 1024 * 1024;
+  const total = lines.length;
+  const progressMsg = await bot.sendMessage(chatId, `⏳ Processing ${total} entries... 0/${total}`);
 
-  for (const f of files) {
-    let size = 0;
-    try { size = fs.statSync(f.abs).size; } catch { continue; }
+  let done = 0;
+  const results = [];
 
-    const wouldExceed = curBytes + size > byteCap || cur.length >= ZIP_CHUNK_COUNT;
-    if (cur.length && wouldExceed) {
-      bundles.push(cur);
-      cur = [];
-      curBytes = 0;
+  for (const line of lines) {
+    const parts = line.split(',').map(p => p.trim());
+    if (parts.length < 3) {
+      results.push({ line, status: 'invalid' });
+      done++;
+      continue;
     }
-    cur.push({ ...f, size });
-    curBytes += size;
-  }
-  if (cur.length) bundles.push(cur);
 
-  let idx = 1;
-  for (const bundle of bundles) {
-    const zipName = `${namePrefix}_${Date.now()}_${idx}.zip`;
-    const zipPath = path.join(__dirname, zipName);
-
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const [ssn, dob, zip] = parts;
+    // ✅ Save files with .jpg extension
+    const filename = `${ssn}_${Date.now()}.jpg`;
+    const screenshotPath = path.join(SCREENSHOT_DIR, filename);
 
     try {
-      await new Promise((resolve, reject) => {
-        output.on('close', resolve);
-        archive.on('error', reject);
-        archive.pipe(output);
-        for (const f of bundle) archive.file(f.abs, { name: f.name });
-        archive.finalize();
-      });
+      const { status } = await runAutomation(ssn, dob, zip, screenshotPath);
+      results.push({ line, status, screenshot: filename });
+    } catch (err) {
+      results.push({ line, status: 'error', screenshot: filename });
+    }
 
-      const sizeMB = Math.round((fs.statSync(zipPath).size / 1024 / 1024) * 10) / 10;
-      console.log(`Sending ZIP ${idx}/${bundles.length} ~${sizeMB}MB: ${zipName}`);
-      await botInst.sendChatAction(chatId, 'upload_document').catch(()=>{});
-      await botInst.sendDocument(
-        chatId,
-        { source: fs.createReadStream(zipPath), filename: zipName }
-      );
+    done++;
+    const barLen = 20, filled = Math.round((done/total)*barLen);
+    const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+    await bot.editMessageText(
+      `⏳ Processing ${total} entries...\n${bar} ${done}/${total}`,
+      { chat_id: chatId, message_id: progressMsg.message_id }
+    ).catch(()=>{});
+  }
+
+  // Zip and send results
+  const zipPath = path.join(__dirname, `screenshots_${Date.now()}.zip`);
+  const output = fs.createWriteStream(zipPath);
+  const archive = archiver('zip', { zlib: { level: 9 } });
+
+  output.on('close', async () => {
+    try {
+      await bot.sendDocument(chatId, zipPath);
     } catch (e) {
-      console.error(`send ZIP failed (${zipName}):`, e?.message || e);
-
-      for (const f of bundle) {
-        try {
-          const sizeMB = Math.round((f.size / 1024 / 1024) * 10) / 10;
-          console.log(`Fallback: sending file ${f.name} (~${sizeMB}MB)`);
-          await botInst.sendChatAction(chatId, 'upload_document').catch(()=>{});
-          await botInst.sendDocument(
-            chatId,
-            { source: fs.createReadStream(f.abs), filename: f.name }
-          );
-          await new Promise(r => setTimeout(r, 400));
-        } catch (e2) {
-          console.error('send single failed:', f.name, e2?.message || e2);
-          await botInst.sendMessage(chatId, `❌ Failed to send ${f.name}`);
-        }
-      }
+      await bot.sendMessage(chatId, '❌ Failed to send ZIP archive.');
     } finally {
       try { fs.unlinkSync(zipPath); } catch {}
     }
 
-    idx++;
-  }
-}
-
-// =========================
-// Progress-enabled handler
-// =========================
-bot.on('message', async (msg) => {
-  const chatId = String(msg.chat.id);
-  const text = (msg.text || '').trim();
-  const ok = isApproved(chatId);
-
-  // Skip commands; they have their own handlers
-  if (!text || text.startsWith('/')) return;
-
-  // De-dup: ignore retries of same Telegram message
-  if (seenMessageIds.has(msg.message_id)) return;
-  seenMessageIds.add(msg.message_id);
-
-  // Per-chat lock: avoid overlapping batches in same chat
-  if (processingChats.has(chatId)) {
-    return bot.sendMessage(chatId, '⏳ Still processing your previous batch. Please wait.');
-  }
-  processingChats.add(chatId);
-
-  console.log(`🔧 MSG from ${chatId} approved=${ok} text=${JSON.stringify(text.slice(0, 60))}`);
-  if (!ok) {
-    processingChats.delete(chatId);
-    return bot.sendMessage(chatId, '🚫 Access Denied: You are not an approved user.');
-  }
-
-  // Parse lines
-  const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  if (rawLines.length === 0) {
-    processingChats.delete(chatId);
-    return;
-  }
-
-  const lines = rawLines;
-  const total = lines.length;
-  const startedAt = Date.now();
-
-  // Initial progress message
-  const progressMsg = await bot.sendMessage(
-    chatId,
-    `⏳ Processing ${total} entries... 0/${total}`
-  );
-
-  // Throttle progress edits (max ~1 per 1.2s) and always on final
-  let lastEdit = 0;
-  const maybeUpdateProgress = async (done) => {
-    const now = Date.now();
-    if (done === total || now - lastEdit >= 1200) {
-      const elapsed = Math.round((now - startedAt) / 1000);
-      const barLen = 20;
-      const filled = Math.max(0, Math.min(barLen, Math.round((done / total) * barLen)));
-      const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
-      await bot.editMessageText(
-        `⏳ Processing ${total} entries...\n${bar} ${done}/${total}\n⏱️ ${elapsed}s elapsed`,
-        { chat_id: chatId, message_id: progressMsg.message_id }
-      ).catch(() => {});
-      lastEdit = now;
+    const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
+    for (const r of results) {
+      if (r.status === 'valid') counts.valid++;
+      else if (r.status === 'incorrect') counts.incorrect++;
+      else if (r.status === 'unknown') counts.unknown++;
+      else if (r.status === 'invalid') counts.invalid++;
+      else counts.error++;
     }
-  };
 
-  const results = [];
-  let done = 0;
-
-  // Ensure screenshots dir exists (again)
-  if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-
-  // Process in chunks to control memory spikes on huge pastes
-  const chunks = [];
-  for (let i = 0; i < lines.length; i += CHUNK_SIZE) {
-    chunks.push(lines.slice(i, i + CHUNK_SIZE));
-  }
-
-  try {
-    for (const chunk of chunks) {
-      for (const line of chunk) {
-        const parts = line.split(',').map(p => p.trim());
-        if (parts.length < 3) {
-          results.push({ line, status: 'invalid' });
-          done++; await maybeUpdateProgress(done);
-          continue;
-        }
-
-        const [ssn, dobRaw, zip] = parts;
-        const dob = normalizeDob(dobRaw);
-
-        const filename = `${ssn}_${Date.now()}.png`;
-        const screenshotPath = path.join(SCREENSHOT_DIR, filename);
-
-        try {
-          const { status } = await runAutomation(ssn, dob, zip, screenshotPath);
-          results.push({ line, status, screenshot: filename });
-        } catch (err) {
-          console.error('runAutomation error for', line, err.message || err);
-          results.push({ line, status: 'error', screenshot: filename });
-        }
-
-        done++;
-        await maybeUpdateProgress(done);
-
-        // Gentle pacing to reduce rate limits & RAM churn
-        if (PACE_MS) await new Promise(r => setTimeout(r, PACE_MS));
-      }
-    }
-  } finally {
-    // Continue to packaging and summary even if some entries threw
-  }
-
-  // --- Gather ALL screenshots that exist ---
-  const allFiles = [];
-for (const r of results) {
-  if (!r.screenshot) continue;
-  const abs = path.join(SCREENSHOT_DIR, r.screenshot);
-  if (fs.existsSync(abs)) allFiles.push({ abs, name: r.screenshot });
-}
-await zipAndSend(bot, chatId, allFiles, 'screenshots');
-
-  // Final progress update to 100%
-  await bot.editMessageText(
-    `✅ Done processing. Preparing files to send...`,
-    { chat_id: chatId, message_id: progressMsg.message_id }
-  ).catch(() => {});
-
-  // Send all screenshots in chunked ZIPs (streamed)
-  await zipAndSend(bot, chatId, allFiles, 'screenshots');
-
-  // ===== Send "valid-only" CSV and ZIPs =====
-  try {
-    const validResults = results.filter(r => r.status === 'valid');
-    if (validResults.length) {
-      // CSV of valid lines
-      const csvPath = path.join(__dirname, `valid_${Date.now()}.csv`);
-      const csvHeader = 'ssn,dob,zip\n';
-      const csvBody = validResults.map(v => v.line).join('\n');
-      fs.writeFileSync(csvPath, csvHeader + csvBody);
-      try {
-        await bot.sendDocument(
-          chatId,
-          { source: fs.createReadStream(csvPath), filename: path.basename(csvPath) }
-        );
-      } catch (err) {
-        console.error('send valid.csv failed:', err?.message || err);
-        await bot.sendMessage(chatId, '❌ Failed to send valid.csv');
-      } finally {
-        try { fs.unlinkSync(csvPath); } catch {}
-      }
-
-      // ZIPs of valid screenshots only (chunked, streamed)
-      const validFiles = [];
-      for (const r of validResults) {
-        if (!r.screenshot) continue;
-        const abs = path.join(SCREENSHOT_DIR, r.screenshot);
-        if (fs.existsSync(abs)) validFiles.push({ abs, name: r.screenshot });
-      }
-      await zipAndSend(bot, chatId, validFiles, 'valid_screenshots');
-    } else {
-      await bot.sendMessage(chatId, 'ℹ️ No valid entries detected in this batch.');
-    }
-  } catch (e) {
-    console.error('valid export failed:', e?.message || e);
-  }
-
-  // Summaries
-  const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: 0 };
-  for (const r of results) {
-    if (r.status === 'valid') counts.valid++;
-    else if (r.status === 'incorrect') counts.incorrect++;
-    else if (r.status === 'unknown') counts.unknown++;
-    else if (r.status === 'invalid') counts.invalid++;
-    else counts.error++;
-  }
-
-  let summary =
-`Processed ${total} entries:
+    let summary = `Processed ${total} entries:
 ✅ Valid: ${counts.valid}
 ❌ Incorrect: ${counts.incorrect}
 ❓ Unknown: ${counts.unknown}
 ⚠ Errors: ${counts.error}
 🚫 Invalid Format: ${counts.invalid}`;
 
-  if (counts.invalid > 0) {
-    summary += `
+    await bot.sendMessage(chatId, summary);
+  });
 
-ℹ Expected format (3 fields, comma-separated):
-SSN,DOB (MM/DD/YYYY),ZIPCODE`;
+  archive.pipe(output);
+  for (const r of results) {
+    if (r.screenshot) {
+      const p = path.join(SCREENSHOT_DIR, r.screenshot);
+      if (fs.existsSync(p)) archive.file(p, { name: r.screenshot });
+    }
   }
-
-  await bot.sendMessage(chatId, summary).catch(() => {});
-  processingChats.delete(chatId);
+  archive.finalize();
 });
-
-// (Keep your /export and /clean handlers if you had them)
