@@ -6,7 +6,7 @@
   "engines": { "node": ">=18 <=22" },
   "scripts": {
     "start": "node bot.js",
-    "postinstall": "npx playwright install chromium"
+    "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
