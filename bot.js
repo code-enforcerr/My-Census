@@ -90,36 +90,75 @@ const normalizeDob = (s) => {
 };
 
 // Helper: zip & send files in chunks, streaming each zip
+// knobs (env overrideable)
+// knobs (env overrideable)
+const MAX_ZIP_MB = Math.max(5, parseInt(process.env.MAX_ZIP_MB || '45', 10)); // Telegram is picky
+
+// --- keep only this function below ---
 async function zipAndSend(botInst, chatId, files, namePrefix) {
   if (!files.length) return;
 
-  // split into chunks to keep each zip smaller
-  const chunks = [];
-  for (let i = 0; i < files.length; i += ZIP_CHUNK_COUNT) {
-    chunks.push(files.slice(i, i + ZIP_CHUNK_COUNT));
+  const bundles = [];
+  let cur = [], curBytes = 0;
+  const byteCap = MAX_ZIP_MB * 1024 * 1024;
+
+  for (const f of files) {
+    let size = 0;
+    try { size = fs.statSync(f.abs).size; } catch { continue; }
+
+    const wouldExceed = curBytes + size > byteCap || cur.length >= ZIP_CHUNK_COUNT;
+    if (cur.length && wouldExceed) {
+      bundles.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push({ ...f, size });
+    curBytes += size;
   }
+  if (cur.length) bundles.push(cur);
 
   let idx = 1;
-  for (const chunk of chunks) {
-    const zipPath = path.join(__dirname, `${namePrefix}_${Date.now()}_${idx}.zip`);
+  for (const bundle of bundles) {
+    const zipName = `${namePrefix}_${Date.now()}_${idx}.zip`;
+    const zipPath = path.join(__dirname, zipName);
+
     const output = fs.createWriteStream(zipPath);
     const archive = archiver('zip', { zlib: { level: 9 } });
 
-    await new Promise((resolve, reject) => {
-      output.on('close', resolve);
-      archive.on('error', reject);
-      archive.pipe(output);
-      for (const f of chunk) archive.file(f.abs, { name: f.name });
-      archive.finalize();
-    });
-
     try {
-      const size = fs.statSync(zipPath).size;
-      console.log(`Sending ZIP part ${idx}/${chunks.length} (${Math.round(size/1024/1024)}MB): ${path.basename(zipPath)}`);
-      await botInst.sendDocument(chatId, { source: fs.createReadStream(zipPath), filename: path.basename(zipPath) });
+      await new Promise((resolve, reject) => {
+        output.on('close', resolve);
+        archive.on('error', reject);
+        archive.pipe(output);
+        for (const f of bundle) archive.file(f.abs, { name: f.name });
+        archive.finalize();
+      });
+
+      const sizeMB = Math.round((fs.statSync(zipPath).size / 1024 / 1024) * 10) / 10;
+      console.log(`Sending ZIP ${idx}/${bundles.length} ~${sizeMB}MB: ${zipName}`);
+      await botInst.sendChatAction(chatId, 'upload_document').catch(()=>{});
+      await botInst.sendDocument(
+        chatId,
+        { source: fs.createReadStream(zipPath), filename: zipName }
+      );
     } catch (e) {
-      console.error('sendDocument failed:', e?.message || e);
-      await botInst.sendMessage(chatId, `❌ Failed to send ${path.basename(zipPath)}.`);
+      console.error(`send ZIP failed (${zipName}):`, e?.message || e);
+
+      for (const f of bundle) {
+        try {
+          const sizeMB = Math.round((f.size / 1024 / 1024) * 10) / 10;
+          console.log(`Fallback: sending file ${f.name} (~${sizeMB}MB)`);
+          await botInst.sendChatAction(chatId, 'upload_document').catch(()=>{});
+          await botInst.sendDocument(
+            chatId,
+            { source: fs.createReadStream(f.abs), filename: f.name }
+          );
+          await new Promise(r => setTimeout(r, 400));
+        } catch (e2) {
+          console.error('send single failed:', f.name, e2?.message || e2);
+          await botInst.sendMessage(chatId, `❌ Failed to send ${f.name}`);
+        }
+      }
     } finally {
       try { fs.unlinkSync(zipPath); } catch {}
     }
@@ -238,11 +277,12 @@ bot.on('message', async (msg) => {
 
   // --- Gather ALL screenshots that exist ---
   const allFiles = [];
-  for (const r of results) {
-    if (!r.screenshot) continue;
-    const abs = path.join(SCREENSHOT_DIR, r.screenshot);
-    if (fs.existsSync(abs)) allFiles.push({ abs, name: r.screenshot });
-  }
+for (const r of results) {
+  if (!r.screenshot) continue;
+  const abs = path.join(SCREENSHOT_DIR, r.screenshot);
+  if (fs.existsSync(abs)) allFiles.push({ abs, name: r.screenshot });
+}
+await zipAndSend(bot, chatId, allFiles, 'screenshots');
 
   // Final progress update to 100%
   await bot.editMessageText(
