@@ -22,7 +22,7 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
 
   try {
     // 🔑 Replace with your own authorized/staging URL
-    const url = process.env.TARGET_URL || '';
+    const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
     console.log('Navigating to:', url);
 
     await page.goto(url, {
