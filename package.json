@@ -1,13 +1,12 @@
 {
   "name": "census-code",
-  "version": "1.0.0",
   "private": true,
   "type": "commonjs",
   "main": "bot.js",
   "engines": { "node": ">=18 <=22" },
   "scripts": {
     "start": "node bot.js",
-    "postinstall": "npx playwright install --with-deps chromium"
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
