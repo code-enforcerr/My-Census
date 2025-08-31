@@ -49,26 +49,82 @@ const TMP_DIR = process.env.TMPDIR || '/tmp';
 const SCREENSHOT_DIR = path.join(TMP_DIR, 'screenshots');
 (async () => { await fsp.mkdir(SCREENSHOT_DIR, { recursive: true }).catch(() => {}); })();
 
-// ---- Create bot (start polling explicitly to avoid 409 conflicts) ----
+// ---- Create bot & safe polling (prevents 409 conflicts) ----
 const bot = new TelegramBot(TOKEN, { polling: false });
 
-(async () => {
+// Prevent double-start
+let __botStarted = false;
+
+async function startPollingSafe() {
+  if (__botStarted) {
+    console.log('⚠️ Polling already started; skipping.');
+    return;
+  }
+  __botStarted = true;
+
   try {
-    // Remove any webhook & drop pending updates; then start polling
-    await bot.deleteWebHook({ drop_pending_updates: true });
-    await bot.startPolling({ params: { allowed_updates: ['message'] } });
+    // Stop any polling just in case
+    await bot.stopPolling().catch(() => {});
+
+    // Clear webhook if set
+    try {
+      const infoBefore = await bot.getWebHookInfo();
+      if (infoBefore && infoBefore.url) {
+        console.log('🔗 Webhook detected, deleting →', infoBefore.url);
+        await bot.deleteWebHook({ drop_pending_updates: true });
+        // Wait for confirmation
+        for (let i = 0; i < 6; i++) {
+          const info = await bot.getWebHookInfo();
+          if (!info.url) break;
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    } catch (e) {
+      console.log('getWebHookInfo/deleteWebHook warning:', e?.message || e);
+    }
+
+    await bot.startPolling({
+      params: { allowed_updates: ['message'] },
+    });
     console.log('🤖 Bot polling started.');
   } catch (e) {
-    console.error('Failed to start polling:', e);
+    console.error('Failed to start polling:', e?.message || e);
   }
-})();
+}
+startPollingSafe();
+
+// Clean shutdown
+async function stopPollingSafe() {
+  try { await bot.stopPolling(); } catch {}
+}
+process.once('SIGTERM', async () => { console.log('🛑 SIGTERM'); await stopPollingSafe(); process.exit(0); });
+process.once('SIGINT',  async () => { console.log('🛑 SIGINT');  await stopPollingSafe(); process.exit(0); });
+
+// Auto-recover from 409
+bot.on('polling_error', async (err) => {
+  const msg = err?.response?.body || err?.message || String(err);
+  console.error('error: [polling_error]', msg);
+  if (err?.code === 'ETELEGRAM' && /409/.test(msg)) {
+    console.log('🔁 409 detected: attempting recovery…');
+    try {
+      await bot.stopPolling().catch(() => {});
+      await bot.deleteWebHook({ drop_pending_updates: false }).catch(() => {});
+      await new Promise(r => setTimeout(r, 1500));
+      await bot.startPolling({ params: { allowed_updates: ['message'] } });
+      console.log('✅ Recovered from 409; polling restarted.');
+    } catch (e) {
+      console.error('❌ 409 recovery failed:', e?.message || e);
+    }
+  }
+});
 
 // ---- Commands ----
 bot.setMyCommands([
   { command: '/start',   description: 'Start the bot' },
   { command: '/export',  description: 'Download all screenshots as ZIP' },
   { command: '/clean',   description: 'Clear all saved results' },
-  { command: '/whoami',  description: 'Show your chat id' }
+  { command: '/whoami',  description: 'Show your chat id' },
+  { command: '/status',  description: 'Service status & counters' }
 ]);
 
 bot.onText(/^\/whoami$/, (msg) => {
@@ -81,10 +137,20 @@ bot.onText(/^\/whoami$/, (msg) => {
 bot.onText(/^\/start$/, (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied: You are not an approved user.');
-  bot.sendMessage(chatId, `👋 Send data in this format:
-SSN,DOB (MM/DD/YYYY),ZIPCODE
+  bot.sendMessage(chatId, `👋 *Welcome!*
 
-📦 Use multiple lines for bulk. Then send /export to download results.`);
+📌 Send your data in this format:
+\`SSN,DOB (MM/DD/YYYY),ZIPCODE\`
+
+📦 Use multiple lines for bulk.
+
+⚠️ *Important:*
+- Send a maximum of *30 entries per section*.
+- Always run /clean before starting a new section.
+
+Then send /export to download results.`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.onText(/^\/clean$/, async (msg) => {
@@ -109,6 +175,60 @@ bot.onText(/^\/export$/, async (msg) => {
   await sendZipArchive(bot, chatId, files, 'screenshots');
 });
 
+// ---- /status ----
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return `${n}`;
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${h}h ${m}m ${s}s`;
+}
+bot.onText(/^\/status$/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
+
+  try {
+    const names = await fsp.readdir(SCREENSHOT_DIR).catch(() => []);
+    const images = names.filter(n => /\.(jpe?g|png)$/i.test(n));
+    const notes  = names.filter(n => /\.txt$/i.test(n));
+
+    let totalSize = 0;
+    for (const n of images) {
+      try { const st = await fsp.stat(path.join(SCREENSHOT_DIR, n)); totalSize += st.size; } catch {}
+    }
+
+    const mem = process.memoryUsage();
+    const targetUrlSet = !!(process.env.TARGET_URL && /^https?:\/\//i.test(process.env.TARGET_URL));
+
+    const report =
+`🩺 *Service Status*
+• Uptime: ${formatUptime(process.uptime())}
+• Memory (RSS): ${formatBytes(mem.rss)}  (Heap: ${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)})
+
+🗂 *Storage*
+• Screenshots: ${images.length} file${images.length===1?'':'s'} (${formatBytes(totalSize)})
+• Error notes: ${notes.length} file${notes.length===1?'':'s'}
+• TMP_DIR: \`${TMP_DIR}\`
+• SCREENSHOT_DIR: \`${SCREENSHOT_DIR}\`
+
+🔧 *Config*
+• APPROVED_USERS: ${approvedUsers.length}
+• TARGET_URL set: ${targetUrlSet ? '✅' : '❌'}
+`;
+
+    await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('/status error', e);
+    await bot.sendMessage(chatId, '⚠️ Failed to gather status.');
+  }
+});
+
 // ---- Message handler (bulk processing with progress) ----
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
@@ -129,9 +249,19 @@ bot.on('message', async (msg) => {
     if (parsed) lines.push(parsed);
     else invalidLines.push(raw);
   }
-  if (lines.length === 0) {
-    return bot.sendMessage(chatId, '⚠️ No valid lines found. Expected: SSN,DOB(MM/DD/YYYY),ZIP.');
-  }
+ if (lines.length === 0) {
+  return bot.sendMessage(chatId, '⚠️ No valid lines found. Expected: SSN,DOB(MM/DD/YYYY),ZIP.');
+}
+
+// Enforce maximum of 30 entries per section
+if (lines.length > 30) {
+  return bot.sendMessage(chatId, `🚫 You submitted *${lines.length} entries*.
+
+⚠️ Maximum allowed is *30 entries per section*.
+🧹 Please run /clean, then resend your data in smaller chunks.`,
+    { parse_mode: 'Markdown' }
+  );
+}
 
   const total = lines.length;
   const startedAt = Date.now();
@@ -180,8 +310,6 @@ bot.on('message', async (msg) => {
     { chat_id: chatId, message_id: progressMsg.message_id }
   ).catch(() => {});
 
-  // (We no longer send a big batch ZIP to avoid duplicates)
-
   // Per-category archives
   const groups = {
     valid:     results.filter(r => r.status === 'valid'),
@@ -221,7 +349,41 @@ Skipped lines:
 ℹ Expected format (comma or pipe):
 SSN,DOB (MM/DD/YYYY),ZIPCODE`;
   }
-  await bot.sendMessage(chatId, summary);
+  await bot.sendMessage(chatId,
+  summary + `
+
+⚠️ *Reminder:*
+- Maximum of 30 entries per section
+- Run /clean before starting a new section`,
+  { parse_mode: 'Markdown' }
+);
+
+  // ---------- Batch metrics / memory log ----------
+  try {
+    const names = await fsp.readdir(SCREENSHOT_DIR).catch(() => []);
+    const images = names.filter(n => /\.(jpe?g|png)$/i.test(n));
+    let totalSize = 0;
+    for (const n of images) {
+      try { const st = await fsp.stat(path.join(SCREENSHOT_DIR, n)); totalSize += st.size; } catch {}
+    }
+    const mem = process.memoryUsage();
+    console.log([
+      '📊 Batch metrics:',
+      `entries=${total}`,
+      `valid=${counts.valid}`,
+      `incorrect=${counts.incorrect}`,
+      `unknown=${counts.unknown}`,
+      `errors=${counts.error}`,
+      `screenshots=${images.length}`,
+      `shotsSize=${formatBytes(totalSize)}`,
+      `rss=${formatBytes(mem.rss)}`,
+      `heapUsed=${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)}`,
+      `uptime=${Math.round(process.uptime())}s`,
+    ].join(' | '));
+  } catch (e) {
+    console.log('📊 Batch metrics logging failed:', e?.message || e);
+  }
+  // -----------------------------------------------
 });
 
 // ---- ZIP utility ----
@@ -246,9 +408,7 @@ async function sendZipArchive(bot, chatId, filePaths, baseName = 'screenshots') 
 
     for (const fp of filePaths) {
       if (fs.existsSync(fp)) {
-        // include image
         archive.file(fp, { name: path.basename(fp) });
-        // include optional error note next to image, if present
         const note = fp.replace(/\.(png|jpg|jpeg)$/i, '.txt');
         if (fs.existsSync(note)) {
           archive.file(note, { name: path.basename(note) });
