@@ -1,11 +1,10 @@
-// automation.js
-// Use only on sites you have permission to automate.
-// Returns: { status: 'valid'|'incorrect'|'unknown'|'error', screenshotPath }
-
 const { chromium } = require('playwright');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+
+// ---------- Image size knob (env-tunable) ----------
+const JPEG_QUALITY = Math.min(95, Math.max(20, parseInt(process.env.JPEG_QUALITY || '30', 10))); // default 30
 
 // ---------- Helpers ----------
 function normalizeDOB(input) {
@@ -37,7 +36,7 @@ async function ensureWritablePath(requestedPath, base = 'shot') {
   }
 }
 
-// ---------- NEW: tiny helpers for unique filenames ----------
+// ---------- Unique filename helpers ----------
 function normalizeSSN(s) { return String(s || '').replace(/\D/g, '').slice(0, 9); }
 function ts() { return new Date().toISOString().replace(/[:.]/g, '-'); }
 function sanitize(s = '') { return s.replace(/[^a-z0-9._-]/gi, '_'); }
@@ -53,7 +52,7 @@ function withUniqueSuffix(p) {
   return path.join(parsed.dir || process.cwd(), `${parsed.name || 'shot'}_${ts()}${ext}`);
 }
 
-// ---------- Browser singleton to save memory ----------
+// ---------- Browser singleton ----------
 let _browserSingleton = null;
 async function getBrowser() {
   if (_browserSingleton && _browserSingleton.isConnected()) return _browserSingleton;
@@ -82,15 +81,15 @@ async function getBrowser() {
 async function runAutomation(ssn, dob, zip, screenshotPath) {
   const browser = await getBrowser();
 
-  // Compact viewport for smaller screenshots
+  // Smaller viewport for smaller screenshots
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36',
-    viewport: { width: 820, height: 900 },
-    deviceScaleFactor: 1, // keep file size down
+    viewport: { width: 680, height: 760 },  // reduced from 820x900
+    deviceScaleFactor: 1,
   });
 
-  // Block heavy resources (keep CSS for layout)
+  // Block heavy resources
   await context.route('**/*', (route) => {
     const t = route.request().resourceType();
     if (t === 'image' || t === 'media' || t === 'font') return route.abort();
@@ -98,35 +97,32 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
   });
 
   const page = await context.newPage();
-
   let status = 'error';
 
-  // ---------- UPDATED: always use a unique file path ----------
+  // Unique file path
   let shotPath;
   if (screenshotPath) {
-    // If caller gave a file path, append a timestamp suffix so parallel runs don't overwrite
     const ensured = await ensureWritablePath(screenshotPath, 'shot');
     shotPath = withUniqueSuffix(ensured);
   } else {
-    // If no path provided, create one like screenshots/SSN_ZIP_TIMESTAMP.jpg
     shotPath = await uniqueShotPath(ssn, zip);
   }
 
   try {
     // --- URL guard ---
-    const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
+    const url = process.env.TARGET_URL || '';
     if (!/^https?:\/\//i.test(url) || /YOUR_AUTHORIZED_URL_HERE|dommy/i.test(url)) {
       throw new Error('TARGET_URL is not set to a real authorized https URL');
     }
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Try to ensure the form exists (best-effort)
+    // Wait for form
     try {
       await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 });
     } catch {}
 
-    // --- Fill fields ---
+    // Fill fields helper
     const dobNorm = normalizeDOB(dob);
     const tryFill = async (selectors, value) => {
       for (const sel of selectors) {
@@ -169,7 +165,7 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
       throw new Error(`Could not locate all fields: ssn:${okSSN} dob:${okDOB} zip:${okZIP}`);
     }
 
-    // --- Submit ---
+    // Submit
     const clicked = await (async () => {
       const buttons = [
         'button:has-text("Next")',
@@ -191,32 +187,21 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     })();
     if (!clicked) throw new Error('Submit button not found');
 
-    // Let the site process
-    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
-    await page.waitForTimeout(2000);
+    // Wait for response
+    try {
+      await Promise.race([
+        page.waitForLoadState('networkidle', { timeout: 12000 }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 })
+      ]);
+    } catch {}
+    await page.waitForTimeout(1500);
 
-    // --- Element-based classification ---
-    // Incorrect signals
-    const redBanner = await page
-      .getByText(/web access .* currently unavailable/i, { exact: false })
-      .first().isVisible().catch(() => false);
-
-    const identityHeading = await page
-      .getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i })
-      .isVisible().catch(() => false);
-
-    const anyAlert = await page
-      .locator('[role="alert"], .alert, .validation, .error, .error-message, .message--error')
-      .first().isVisible().catch(() => false);
-
-    // Valid signals
-    const setupHeading = await page
-      .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
-      .isVisible().catch(() => false);
-
-    const usernameVisible = await page
-      .getByLabel(/username/i)
-      .isVisible().catch(() => false);
+    // --- Classification ---
+    const redBanner = await page.getByText(/web access .* currently unavailable/i).first().isVisible().catch(() => false);
+    const identityHeading = await page.getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i }).isVisible().catch(() => false);
+    const anyAlert = await page.locator('[role="alert"], .alert, .validation, .error, .error-message, .message--error').first().isVisible().catch(() => false);
+    const setupHeading = await page.getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i }).isVisible().catch(() => false);
+    const usernameVisible = await page.getByLabel(/username/i).isVisible().catch(() => false);
 
     if (redBanner || identityHeading || anyAlert) {
       status = 'incorrect';
@@ -224,26 +209,21 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
       status = 'valid';
     } else {
       const html = await page.content().catch(() => '');
-      const SUCCESS_RULES = [
-        /create your username/i,
-        /security questions/i,
-        /confirmation sent/i,
-        /identity.*account.*email.*security.*review/i, // progress bar
-      ];
-      const INCORRECT_RULES = [
-        /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
-      ];
-      if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
-      else if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
-      else status = 'unknown';
+      if (/could not find|unable to find|do not have an account|not recognized|incorrect|no match/i.test(html)) {
+        status = 'incorrect';
+      } else if (/create your username|security questions|confirmation sent|identity.*account.*email.*security.*review/i.test(html)) {
+        status = 'valid';
+      } else {
+        status = 'unknown';
+      }
     }
 
-    // --- Small screenshot (tight crop, JPEG quality 45) ---
+    // --- Screenshot (smaller, JPEG) ---
     try {
       const form = page.locator('form').first();
       const box = await form.boundingBox();
       if (box) {
-        const padX = 20, padTop = 120, padBottom = 80;
+        const padX = 20, padTop = 100, padBottom = 60;
         const vp = context.viewportSize();
         const x = Math.max(0, box.x - padX);
         const y = Math.max(0, box.y - padTop);
@@ -252,14 +232,14 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
         await page.screenshot({
           path: shotPath,
           type: 'jpeg',
-          quality: 45,
+          quality: JPEG_QUALITY,
           clip: { x, y, width, height },
         });
       } else {
-        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: false });
+        await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
       }
     } catch {
-      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: false });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
     }
 
     return { status, screenshotPath: shotPath };
@@ -268,9 +248,8 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     console.error('❌ Error in runAutomation:', reason);
 
     try {
-      // keep the same file but ensure it exists and append a note
       await fsp.mkdir(path.dirname(shotPath), { recursive: true });
-      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: true });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: true });
       const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
       await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');
     } catch {}
@@ -278,7 +257,6 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     return { status: 'error', screenshotPath: shotPath };
   } finally {
     try { await context.close(); } catch {}
-    // Do NOT close the browser; it's reused by the singleton
   }
 }
 

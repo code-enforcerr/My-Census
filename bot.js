@@ -426,6 +426,7 @@ const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);               
 const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '80000', 10);  // per entry timeout
 const RETRY_ERRORS = parseInt(process.env.RETRY_ERRORS || '1', 10);              // retry passes
 const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);       // delay before retry pass
+const MAX_ENTRIES = parseInt(process.env.MAX_ENTRIES || '70', 10);               // per-batch cap
 // =================================================
 
 // ---------- Helpers ----------
@@ -562,10 +563,13 @@ bot.onText(/^\/whoami$/, (msg) => {
 bot.onText(/^\/start$/, (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
-  bot.sendMessage(chatId, `👋 Welcome! Send data in format:
+  bot.sendMessage(
+    chatId,
+    `👋 Welcome! Send data in format:
 \`SSN,DOB (MM/DD/YYYY),ZIPCODE\`
-(max 30 entries). Use /export to download the latest batch.`,
-    { parse_mode: 'Markdown' });
+(max ${MAX_ENTRIES} entries). Use /export to download the latest batch.`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // Clean ONLY this chat’s files
@@ -613,7 +617,8 @@ bot.onText(/^\/status$/, async (msg) => {
 • Uptime: ${formatUptime(process.uptime())}
 • Memory (RSS): ${formatBytes(mem.rss)}
 • Your screenshots: ${imagesCount}
-• Concurrency: ${CONCURRENCY}, Timeout: ${ENTRY_TIMEOUT_MS/1000}s, Retries: ${RETRY_ERRORS}`);
+• Concurrency: ${CONCURRENCY}, Timeout: ${ENTRY_TIMEOUT_MS/1000}s, Retries: ${RETRY_ERRORS}
+• Max entries per batch: ${MAX_ENTRIES}`);
 });
 
 // ---- Message handler (main batch processing) ----
@@ -630,7 +635,9 @@ bot.on('message', async (msg) => {
     const p=parseEntryLine(raw); if(p) lines.push(p); else invalid.push(raw);
   }
   if (!lines.length) return bot.sendMessage(chatId,'⚠️ No valid lines found.');
-  if (lines.length>30) return bot.sendMessage(chatId,`🚫 Too many entries (${lines.length}), max 30.`);
+  if (lines.length > MAX_ENTRIES) {
+    return bot.sendMessage(chatId, `🚫 Too many entries (${lines.length}), max ${MAX_ENTRIES}.`);
+  }
 
   // Create per-batch directory (isolates exports)
   const batchDir = await makeBatchDir(chatId, batchId);
