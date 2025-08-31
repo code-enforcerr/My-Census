@@ -422,10 +422,10 @@ const archiver = require('archiver');
 const { runAutomation } = require('./automation');
 
 // ================== Config knobs ==================
-const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);              // parallel entries
-const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '80000', 10); // per entry timeout
-const RETRY_ERRORS = parseInt(process.env.RETRY_ERRORS || '1', 10);            // how many retry passes
-const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);     // wait before retry pass
+const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);                // parallel entries
+const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '80000', 10);  // per entry timeout
+const RETRY_ERRORS = parseInt(process.env.RETRY_ERRORS || '1', 10);              // retry passes
+const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);       // delay before retry pass
 // =================================================
 
 // ---------- Helpers ----------
@@ -463,7 +463,6 @@ function withTimeout(promise, ms, label = 'task') {
   const timer = new Promise((_, rej) => t = setTimeout(() => rej(new Error(`${label} timeout after ${ms}ms`)), ms));
   return Promise.race([promise, timer]).finally(() => clearTimeout(t));
 }
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // --- Fail fast if token is missing ---
@@ -479,10 +478,42 @@ const approvedUsers = rawApproved.split(',').map(s => s.trim()).filter(Boolean);
 console.log('🔧 ENV DEBUG → approvedUsers:', approvedUsers);
 const isApproved = (id) => approvedUsers.includes(String(id).trim());
 
-// ---- Writable dirs ----
+// ---- Writable dirs (global root) ----
 const TMP_DIR = process.env.TMPDIR || '/tmp';
-const SCREENSHOT_DIR = path.join(TMP_DIR, 'screenshots');
-(async () => { await fsp.mkdir(SCREENSHOT_DIR, { recursive: true }).catch(() => {}); })();
+const SCREENSHOT_ROOT = path.join(TMP_DIR, 'screenshots');
+(async () => { await fsp.mkdir(SCREENSHOT_ROOT, { recursive: true }).catch(() => {}); })();
+
+// ---- Per-chat & per-batch helpers ----
+function chatDir(chatId) {
+  return path.join(SCREENSHOT_ROOT, `chat_${chatId}`);
+}
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true }).catch(() => {});
+}
+async function makeBatchDir(chatId, batchId) {
+  const dir = path.join(chatDir(chatId), `batch_${batchId}`);
+  await ensureDir(dir);
+  return dir;
+}
+async function listBatches(chatId) {
+  const dir = chatDir(chatId);
+  const names = await fsp.readdir(dir).catch(() => []);
+  const items = await Promise.all(names.map(async n => {
+    const p = path.join(dir, n);
+    const st = await fsp.stat(p).catch(() => null);
+    return st?.isDirectory() ? { name: n, path: p, mtime: st.mtimeMs } : null;
+  }));
+  return items.filter(Boolean).sort((a,b)=>b.mtime - a.mtime);
+}
+async function listAllImagesForChat(chatId) {
+  const batches = await listBatches(chatId);
+  let count = 0;
+  for (const b of batches) {
+    const files = await fsp.readdir(b.path).catch(() => []);
+    count += files.filter(n => /\.(jpe?g|png)$/i.test(n)).length;
+  }
+  return count;
+}
 
 // ---- Bot setup ----
 const bot = new TelegramBot(TOKEN, { polling: false });
@@ -517,8 +548,8 @@ bot.on('polling_error', async (err) => {
 // ---- Commands ----
 bot.setMyCommands([
   { command: '/start', description: 'Start the bot' },
-  { command: '/export', description: 'Download all screenshots' },
-  { command: '/clean', description: 'Clear all saved results' },
+  { command: '/export', description: 'Download latest batch (this chat only)' },
+  { command: '/clean', description: 'Clear your saved results' },
   { command: '/whoami', description: 'Show your chat id' },
   { command: '/status', description: 'Service status & counters' }
 ]);
@@ -533,25 +564,33 @@ bot.onText(/^\/start$/, (msg) => {
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
   bot.sendMessage(chatId, `👋 Welcome! Send data in format:
 \`SSN,DOB (MM/DD/YYYY),ZIPCODE\`
-(max 30 entries). Use /export to download results.`,
+(max 30 entries). Use /export to download the latest batch.`,
     { parse_mode: 'Markdown' });
 });
 
+// Clean ONLY this chat’s files
 bot.onText(/^\/clean$/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
-  const items = await fsp.readdir(SCREENSHOT_DIR).catch(() => []);
-  await Promise.all(items.map(i => fsp.unlink(path.join(SCREENSHOT_DIR, i)).catch(() => {})));
-  await bot.sendMessage(chatId, '🧹 Cleaned screenshots.');
+  const dir = chatDir(chatId);
+  await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  await bot.sendMessage(chatId, '🧹 Cleaned your screenshots.');
 });
 
+// Export ONLY the latest batch for this chat
 bot.onText(/^\/export$/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
-  const files = (await fsp.readdir(SCREENSHOT_DIR).catch(() => []))
-    .map(n => path.join(SCREENSHOT_DIR, n))
+
+  const batches = await listBatches(chatId);
+  if (!batches.length) return bot.sendMessage(chatId, 'ℹ️ No batches to export.');
+
+  const latest = batches[0].path;
+  const files = (await fsp.readdir(latest).catch(() => []))
+    .map(n => path.join(latest, n))
     .filter(fp => /\.(jpe?g|png|txt)$/i.test(fp) && fs.existsSync(fp));
-  await sendZipArchive(bot, chatId, files, 'screenshots');
+
+  await sendZipArchive(bot, chatId, files, path.basename(latest));
 });
 
 // ---- Status ----
@@ -567,18 +606,17 @@ function formatUptime(sec) {
 bot.onText(/^\/status$/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
-  const names = await fsp.readdir(SCREENSHOT_DIR).catch(() => []);
-  const images = names.filter(n => /\.(jpe?g|png)$/i.test(n));
+  const imagesCount = await listAllImagesForChat(chatId).catch(() => 0);
   const mem = process.memoryUsage();
   await bot.sendMessage(chatId,
 `🩺 Status
 • Uptime: ${formatUptime(process.uptime())}
-• Memory: ${formatBytes(mem.rss)}
-• Screenshots: ${images.length}
+• Memory (RSS): ${formatBytes(mem.rss)}
+• Your screenshots: ${imagesCount}
 • Concurrency: ${CONCURRENCY}, Timeout: ${ENTRY_TIMEOUT_MS/1000}s, Retries: ${RETRY_ERRORS}`);
 });
 
-// ---- Message handler ----
+// ---- Message handler (main batch processing) ----
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
   const text = (msg.text || '').trim();
@@ -594,6 +632,10 @@ bot.on('message', async (msg) => {
   if (!lines.length) return bot.sendMessage(chatId,'⚠️ No valid lines found.');
   if (lines.length>30) return bot.sendMessage(chatId,`🚫 Too many entries (${lines.length}), max 30.`);
 
+  // Create per-batch directory (isolates exports)
+  const batchDir = await makeBatchDir(chatId, batchId);
+  const filesThisRun = [];
+
   const total = lines.length;
   const progressMsg = await bot.sendMessage(chatId,`⏳ Processing ${total} entries...`);
 
@@ -607,35 +649,43 @@ bot.on('message', async (msg) => {
   };
 
   const results = Array(total);
-  await fsp.mkdir(SCREENSHOT_DIR,{recursive:true}).catch(()=>{});
   const limit=pLimit(CONCURRENCY);
 
   // ---- First pass ----
   const tasks = lines.map(({ssn,dob,zip,raw},i)=>limit(async()=>{
-    const requested=path.join(SCREENSHOT_DIR,`${batchId}_${ssn}.jpg`);
+    const requested = path.join(batchDir, `${ssn}.jpg`);
     try{
-      const {status,screenshotPath:real}=await withTimeout(runAutomation(ssn,dob,zip,requested),ENTRY_TIMEOUT_MS,`runAutomation(${ssn})`);
-      results[i]={line:raw,status,path:real,name:path.basename(real),attempt:1};
+      const {status,screenshotPath:real} =
+        await withTimeout(runAutomation(ssn,dob,zip,requested),ENTRY_TIMEOUT_MS,`runAutomation(${ssn})`);
+      results[i] = { line: raw, status, path: real, name: path.basename(real), attempt: 1 };
+      if (real && fs.existsSync(real)) filesThisRun.push(real);
     }catch(e){
-      results[i]={line:raw,status:'error',path:requested,name:path.basename(requested),attempt:1};
-    }finally{done++; await maybeUpdate();}
+      results[i] = { line: raw, status:'error', path: requested, name: path.basename(requested), attempt: 1 };
+      // No file pushed on error unless runAutomation wrote one.
+      if (fs.existsSync(requested)) filesThisRun.push(requested);
+    }finally{ done++; await maybeUpdate(); }
   }));
   await Promise.allSettled(tasks);
 
   // ---- Retry passes ----
-  for(let pass=1;pass<=RETRY_ERRORS;pass++){
-    const toRetry=results.map((r,i)=>(r&&r.status==='error'?i:-1)).filter(i=>i>=0);
+  for(let pass=1; pass<=RETRY_ERRORS; pass++){
+    const toRetry = results.map((r,i)=>(r && r.status==='error' ? i : -1)).filter(i=>i>=0);
     if(!toRetry.length) break;
     await bot.sendMessage(chatId,`🔁 Retrying ${toRetry.length} failed entr${toRetry.length===1?'y':'ies'} (pass ${pass})...`);
     await sleep(RETRY_DELAY_MS);
-    const retryTasks=toRetry.map(i=>limit(async()=>{
-      const {ssn,dob,zip,raw}=lines[i];
-      const requested=path.join(SCREENSHOT_DIR,`${batchId}_${ssn}_retry${pass}.jpg`);
+
+    const retryTasks = toRetry.map(i=>limit(async()=>{
+      const { ssn, dob, zip, raw } = lines[i];
+      const requested = path.join(batchDir, `${ssn}_retry${pass}.jpg`);
       try{
-        const {status,screenshotPath:real}=await withTimeout(runAutomation(ssn,dob,zip,requested),ENTRY_TIMEOUT_MS,`retry(${ssn})`);
-        results[i]={line:raw,status,path:real,name:path.basename(real),attempt:pass+1,retried:true};
+        const { status, screenshotPath: real } =
+          await withTimeout(runAutomation(ssn,dob,zip,requested),ENTRY_TIMEOUT_MS,`retry(${ssn})`);
+        results[i] = { line: raw, status, path: real, name: path.basename(real), attempt: pass+1, retried: true };
+        if (real && fs.existsSync(real)) filesThisRun.push(real);
       }catch(e){
-        results[i]={...results[i],attempt:pass+1,retried:true};
+        // Keep previous error result; add attempt count
+        results[i] = { ...results[i], attempt: pass+1, retried: true };
+        if (fs.existsSync(requested)) filesThisRun.push(requested);
       }
     }));
     await Promise.allSettled(retryTasks);
@@ -656,6 +706,11 @@ bot.on('message', async (msg) => {
 ⚠️ Errors: ${counts.error}
 🚫 Invalid: ${counts.invalid}`);
 
+  // ---- Auto-export ONLY this run (optional; keep it) ----
+  const exportList = filesThisRun.filter(fp => fs.existsSync(fp));
+  if (exportList.length) {
+    await sendZipArchive(bot, chatId, exportList, `screenshots-${batchId}`);
+  }
 });
 
 // ---- ZIP utility ----
