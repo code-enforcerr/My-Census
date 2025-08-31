@@ -6,7 +6,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const archiver = require('archiver');
-const express = require('express'); // optional, used if you switch to webhook mode
+// NOTE: express removed (not needed in polling mode)
 const { runAutomation } = require('./automation');
 
 // ----- Helpers -----
@@ -180,10 +180,7 @@ bot.on('message', async (msg) => {
     { chat_id: chatId, message_id: progressMsg.message_id }
   ).catch(() => {});
 
-  // Build list of files and send ALL-in-one archive
-  const filePaths = results
-    .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
-    .filter(fp => fp && fs.existsSync(fp));
+  // (We no longer send a big batch ZIP to avoid duplicates)
 
   // Per-category archives
   const groups = {
@@ -246,7 +243,19 @@ async function sendZipArchive(bot, chatId, filePaths, baseName = 'screenshots') 
     archive.on('error', reject);
 
     archive.pipe(output);
-    for (const fp of filePaths) if (fs.existsSync(fp)) archive.file(fp, { name: path.basename(fp) });
+
+    for (const fp of filePaths) {
+      if (fs.existsSync(fp)) {
+        // include image
+        archive.file(fp, { name: path.basename(fp) });
+        // include optional error note next to image, if present
+        const note = fp.replace(/\.(png|jpg|jpeg)$/i, '.txt');
+        if (fs.existsSync(note)) {
+          archive.file(note, { name: path.basename(note) });
+        }
+      }
+    }
+
     archive.finalize();
   });
 

@@ -7,6 +7,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 
+// ---------- Helpers ----------
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
@@ -36,25 +37,52 @@ async function ensureWritablePath(requestedPath, base = 'shot') {
   }
 }
 
-async function runAutomation(ssn, dob, zip, screenshotPath) {
-  const browser = await chromium.launch({
+// ---------- Browser singleton to save memory ----------
+let _browserSingleton = null;
+async function getBrowser() {
+  if (_browserSingleton && _browserSingleton.isConnected()) return _browserSingleton;
+  _browserSingleton = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--mute-audio',
+      '--disable-gpu',
+      '--renderer-process-limit=1',
     ],
   });
+  return _browserSingleton;
+}
 
-  // Narrow viewport so element screenshots are compact
+// ---------- Main ----------
+async function runAutomation(ssn, dob, zip, screenshotPath) {
+  const browser = await getBrowser();
+
+  // Compact viewport for smaller screenshots
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36',
-    viewport: { width: 900, height: 1000 },
+    viewport: { width: 820, height: 900 },
+    deviceScaleFactor: 1, // keep file size down
+  });
+
+  // Block heavy resources (keep CSS for layout)
+  await context.route('**/*', (route) => {
+    const t = route.request().resourceType();
+    if (t === 'image' || t === 'media' || t === 'font') return route.abort();
+    return route.continue();
   });
 
   const page = await context.newPage();
+
   let status = 'error';
   let shotPath = await ensureWritablePath(
     screenshotPath || path.join(process.env.TMPDIR || '/tmp', 'shot.jpg'),
@@ -62,19 +90,20 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
   );
 
   try {
-    // 🔐 TARGET URL: set env TARGET_URL or hardcode your authorized URL below
+    // --- URL guard ---
     const url = process.env.TARGET_URL || 'https://myaccount.ascensus.com/rplink/account/Setup/Identity';
     if (!/^https?:\/\//i.test(url) || /YOUR_AUTHORIZED_URL_HERE|dommy/i.test(url)) {
       throw new Error('TARGET_URL is not set to a real authorized https URL');
     }
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Try to ensure the form is visible (best-effort)
+    // Try to ensure the form exists (best-effort)
     try {
       await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 });
     } catch {}
 
-    // Fill helpers
+    // --- Fill fields ---
     const dobNorm = normalizeDOB(dob);
     const tryFill = async (selectors, value) => {
       for (const sel of selectors) {
@@ -117,7 +146,7 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
       throw new Error(`Could not locate all fields: ssn:${okSSN} dob:${okDOB} zip:${okZIP}`);
     }
 
-    // Submit
+    // --- Submit ---
     const clicked = await (async () => {
       const buttons = [
         'button:has-text("Next")',
@@ -137,98 +166,96 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
       }
       return false;
     })();
-
     if (!clicked) throw new Error('Submit button not found');
 
     // Let the site process
     try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
 
-    // ----- Element-based classification -----
+    // --- Element-based classification ---
+    // Incorrect signals
+    const redBanner = await page
+      .getByText(/web access .* currently unavailable/i, { exact: false })
+      .first().isVisible().catch(() => false);
 
-    // A. Red banner case → INCORRECT
-    // ----- Element-based classification (final) -----
+    const identityHeading = await page
+      .getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i })
+      .isVisible().catch(() => false);
 
-// A) Strong INCORRECT signals (check first)
-const redBanner = await page
-  .getByText(/web access .* currently unavailable/i, { exact: false })
-  .first()
-  .isVisible()
-  .catch(() => false);
+    const anyAlert = await page
+      .locator('[role="alert"], .alert, .validation, .error, .error-message, .message--error')
+      .first().isVisible().catch(() => false);
 
-const identityHeading = await page
-  .getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i })
-  .isVisible()
-  .catch(() => false);
+    // Valid signals
+    const setupHeading = await page
+      .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
+      .isVisible().catch(() => false);
 
-const anyAlert = await page
-  .locator('[role="alert"], .alert, .validation, .error, .error-message, .message--error')
-  .first()
-  .isVisible()
-  .catch(() => false);
+    const usernameVisible = await page
+      .getByLabel(/username/i)
+      .isVisible().catch(() => false);
 
-// B) Strong VALID signals
-const setupHeading = await page
-  .getByRole('heading', { name: /let(?:'|’|`)?s set up your account|setup your online account/i })
-  .isVisible()
-  .catch(() => false);
+    if (redBanner || identityHeading || anyAlert) {
+      status = 'incorrect';
+    } else if (setupHeading && usernameVisible) {
+      status = 'valid';
+    } else {
+      const html = await page.content().catch(() => '');
+      const SUCCESS_RULES = [
+        /create your username/i,
+        /security questions/i,
+        /confirmation sent/i,
+        /identity.*account.*email.*security.*review/i, // progress bar
+      ];
+      const INCORRECT_RULES = [
+        /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
+      ];
+      if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
+      else if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
+      else status = 'unknown';
+    }
 
-const usernameVisible = await page
-  .getByLabel(/username/i)
-  .isVisible()
-  .catch(() => false);
-
-// Decide in strict order
-if (redBanner || identityHeading || anyAlert) {
-  status = 'incorrect';
-} else if (setupHeading && usernameVisible) {
-  status = 'valid';
-} else {
-  // minimal fallback only (avoid false "valid" on identity page)
-  const html = await page.content().catch(() => '');
-  const SUCCESS_RULES = [
-    /create your username/i,
-    /security questions/i,
-    /confirmation sent/i,
-    /identity.*account.*email.*security.*review/i, // progress bar
-  ];
-  const INCORRECT_RULES = [
-    /could not find|unable to find|do not have an account|not recognized|incorrect|no match/i,
-  ];
-  if (INCORRECT_RULES.some(r => r.test(html))) status = 'incorrect';
-  else if (SUCCESS_RULES.some(r => r.test(html))) status = 'valid';
-  else status = 'unknown';
-}
-
-    // Small screenshot: crop around the form + heading; save as JPEG to reduce size
+    // --- Small screenshot (tight crop, JPEG quality 45) ---
     try {
       const form = page.locator('form').first();
       const box = await form.boundingBox();
       if (box) {
-        const padX = 40, padTop = 160, padBottom = 120;
+        const padX = 20, padTop = 120, padBottom = 80;
+        const vp = context.viewportSize();
         const x = Math.max(0, box.x - padX);
         const y = Math.max(0, box.y - padTop);
-        const width = Math.max(1, Math.min(context.viewportSize().width - x, box.width + padX * 2));
-        const height = Math.max(1, Math.min(context.viewportSize().height - y, box.height + padTop + padBottom));
-        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, clip: { x, y, width, height } });
+        const width = Math.max(1, Math.min(vp.width - x, box.width + padX * 2));
+        const height = Math.max(1, Math.min(vp.height - y, box.height + padTop + padBottom));
+        await page.screenshot({
+          path: shotPath,
+          type: 'jpeg',
+          quality: 45,
+          clip: { x, y, width, height },
+        });
       } else {
-        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: false });
+        await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: false });
       }
     } catch {
-      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: false });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: false });
     }
 
     return { status, screenshotPath: shotPath };
   } catch (err) {
-    console.error('❌ Error in runAutomation:', err?.message || err);
+    const reason = (err && (err.message || String(err))) || 'unknown error';
+    console.error('❌ Error in runAutomation:', reason);
+
     try {
       shotPath = await ensureWritablePath(shotPath, 'shot-error');
-      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 60, fullPage: true });
+      await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: true });
+      // Optional: save a tiny note next to screenshot for debugging
+      const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
+      await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');
     } catch {}
+
     return { status: 'error', screenshotPath: shotPath };
   } finally {
     try { await context.close(); } catch {}
-    try { await browser.close(); } catch {}
+    // Do NOT close the browser; it's reused by the singleton
   }
 }
 
