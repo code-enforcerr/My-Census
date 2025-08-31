@@ -196,6 +196,8 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     } catch {}
     await page.waitForTimeout(1500);
 
+    // done
+
     // --- Classification ---
     const redBanner = await page.getByText(/web access .* currently unavailable/i).first().isVisible().catch(() => false);
     const identityHeading = await page.getByRole('heading', { name: /let(?:'|’|`)?s make sure it'?s you/i }).isVisible().catch(() => false);
