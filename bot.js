@@ -63,16 +63,13 @@ async function startPollingSafe() {
   __botStarted = true;
 
   try {
-    // Stop any polling just in case
     await bot.stopPolling().catch(() => {});
 
-    // Clear webhook if set
     try {
       const infoBefore = await bot.getWebHookInfo();
       if (infoBefore && infoBefore.url) {
         console.log('🔗 Webhook detected, deleting →', infoBefore.url);
         await bot.deleteWebHook({ drop_pending_updates: true });
-        // Wait for confirmation
         for (let i = 0; i < 6; i++) {
           const info = await bot.getWebHookInfo();
           if (!info.url) break;
@@ -238,7 +235,6 @@ bot.on('message', async (msg) => {
 
   console.log(`🔧 MSG from ${chatId} text=${JSON.stringify(text.slice(0, 80))}`);
 
-  // Normalize & split lines; only keep valid ones
   const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const batchId = Date.now().toString();
   const lines = [];
@@ -249,19 +245,18 @@ bot.on('message', async (msg) => {
     if (parsed) lines.push(parsed);
     else invalidLines.push(raw);
   }
- if (lines.length === 0) {
-  return bot.sendMessage(chatId, '⚠️ No valid lines found. Expected: SSN,DOB(MM/DD/YYYY),ZIP.');
-}
+  if (lines.length === 0) {
+    return bot.sendMessage(chatId, '⚠️ No valid lines found. Expected: SSN,DOB(MM/DD/YYYY),ZIP.');
+  }
 
-// Enforce maximum of 30 entries per section
-if (lines.length > 30) {
-  return bot.sendMessage(chatId, `🚫 You submitted *${lines.length} entries*.
+  if (lines.length > 30) {
+    return bot.sendMessage(chatId, `🚫 You submitted *${lines.length} entries*.
 
 ⚠️ Maximum allowed is *30 entries per section*.
 🧹 Please run /clean, then resend your data in smaller chunks.`,
-    { parse_mode: 'Markdown' }
-  );
-}
+      { parse_mode: 'Markdown' }
+    );
+  }
 
   const total = lines.length;
   const startedAt = Date.now();
@@ -290,15 +285,14 @@ if (lines.length > 30) {
   await fsp.mkdir(SCREENSHOT_DIR, { recursive: true }).catch(() => {});
 
   for (const { ssn, dob, zip, raw } of lines) {
-    const filename = `${batchId}_${ssn}.jpg`;           // avoid cross-run collisions
-    const screenshotPath = path.join(SCREENSHOT_DIR, filename);
+    const requested = path.join(SCREENSHOT_DIR, `${batchId}_${ssn}.jpg`);
 
     try {
-      const { status } = await runAutomation(ssn, dob, zip, screenshotPath);
-      results.push({ line: raw, status, screenshot: filename });
+      const { status, screenshotPath: realPath } = await runAutomation(ssn, dob, zip, requested);
+      results.push({ line: raw, status, path: realPath, name: path.basename(realPath) });
     } catch (err) {
       console.error('runAutomation error for', raw, err?.message || err);
-      results.push({ line: raw, status: 'error', screenshot: filename });
+      results.push({ line: raw, status: 'error', path: requested, name: path.basename(requested) });
     }
 
     done++;
@@ -310,7 +304,6 @@ if (lines.length > 30) {
     { chat_id: chatId, message_id: progressMsg.message_id }
   ).catch(() => {});
 
-  // Per-category archives
   const groups = {
     valid:     results.filter(r => r.status === 'valid'),
     incorrect: results.filter(r => r.status === 'incorrect'),
@@ -319,12 +312,11 @@ if (lines.length > 30) {
   };
   for (const [label, arr] of Object.entries(groups)) {
     const files = arr
-      .map(r => r.screenshot && path.join(SCREENSHOT_DIR, r.screenshot))
+      .map(r => r.path)
       .filter(fp => fp && fs.existsSync(fp));
     if (files.length) await sendZipArchive(bot, chatId, files, `screenshots-${label}`);
   }
 
-  // Summary
   const counts = { valid: 0, incorrect: 0, unknown: 0, error: 0, invalid: invalidLines.length };
   for (const r of results) {
     if (r.status === 'valid') counts.valid++;
@@ -357,33 +349,6 @@ SSN,DOB (MM/DD/YYYY),ZIPCODE`;
 - Run /clean before starting a new section`,
   { parse_mode: 'Markdown' }
 );
-
-  // ---------- Batch metrics / memory log ----------
-  try {
-    const names = await fsp.readdir(SCREENSHOT_DIR).catch(() => []);
-    const images = names.filter(n => /\.(jpe?g|png)$/i.test(n));
-    let totalSize = 0;
-    for (const n of images) {
-      try { const st = await fsp.stat(path.join(SCREENSHOT_DIR, n)); totalSize += st.size; } catch {}
-    }
-    const mem = process.memoryUsage();
-    console.log([
-      '📊 Batch metrics:',
-      `entries=${total}`,
-      `valid=${counts.valid}`,
-      `incorrect=${counts.incorrect}`,
-      `unknown=${counts.unknown}`,
-      `errors=${counts.error}`,
-      `screenshots=${images.length}`,
-      `shotsSize=${formatBytes(totalSize)}`,
-      `rss=${formatBytes(mem.rss)}`,
-      `heapUsed=${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)}`,
-      `uptime=${Math.round(process.uptime())}s`,
-    ].join(' | '));
-  } catch (e) {
-    console.log('📊 Batch metrics logging failed:', e?.message || e);
-  }
-  // -----------------------------------------------
 });
 
 // ---- ZIP utility ----

@@ -37,6 +37,22 @@ async function ensureWritablePath(requestedPath, base = 'shot') {
   }
 }
 
+// ---------- NEW: tiny helpers for unique filenames ----------
+function normalizeSSN(s) { return String(s || '').replace(/\D/g, '').slice(0, 9); }
+function ts() { return new Date().toISOString().replace(/[:.]/g, '-'); }
+function sanitize(s = '') { return s.replace(/[^a-z0-9._-]/gi, '_'); }
+async function uniqueShotPath(ssn, zip) {
+  const dir = process.env.SHOT_DIR || path.resolve('screenshots');
+  await fsp.mkdir(dir, { recursive: true });
+  const name = `${sanitize(normalizeSSN(ssn) || 'ssn')}_${sanitize(String(zip) || 'zip')}_${ts()}.jpg`;
+  return path.join(dir, name);
+}
+function withUniqueSuffix(p) {
+  const parsed = path.parse(p);
+  const ext = parsed.ext && /\.(jpe?g|png)$/i.test(parsed.ext) ? parsed.ext : '.jpg';
+  return path.join(parsed.dir || process.cwd(), `${parsed.name || 'shot'}_${ts()}${ext}`);
+}
+
 // ---------- Browser singleton to save memory ----------
 let _browserSingleton = null;
 async function getBrowser() {
@@ -84,10 +100,17 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
   const page = await context.newPage();
 
   let status = 'error';
-  let shotPath = await ensureWritablePath(
-    screenshotPath || path.join(process.env.TMPDIR || '/tmp', 'shot.jpg'),
-    'shot'
-  );
+
+  // ---------- UPDATED: always use a unique file path ----------
+  let shotPath;
+  if (screenshotPath) {
+    // If caller gave a file path, append a timestamp suffix so parallel runs don't overwrite
+    const ensured = await ensureWritablePath(screenshotPath, 'shot');
+    shotPath = withUniqueSuffix(ensured);
+  } else {
+    // If no path provided, create one like screenshots/SSN_ZIP_TIMESTAMP.jpg
+    shotPath = await uniqueShotPath(ssn, zip);
+  }
 
   try {
     // --- URL guard ---
@@ -245,9 +268,9 @@ async function runAutomation(ssn, dob, zip, screenshotPath) {
     console.error('❌ Error in runAutomation:', reason);
 
     try {
-      shotPath = await ensureWritablePath(shotPath, 'shot-error');
+      // keep the same file but ensure it exists and append a note
+      await fsp.mkdir(path.dirname(shotPath), { recursive: true });
       await page.screenshot({ path: shotPath, type: 'jpeg', quality: 45, fullPage: true });
-      // Optional: save a tiny note next to screenshot for debugging
       const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
       await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');
     } catch {}
